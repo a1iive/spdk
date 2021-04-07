@@ -346,6 +346,8 @@ uint64_t spdk_file_get_length(struct spdk_file *file);
 int spdk_file_write(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		    void *payload, uint64_t offset, uint64_t length);
 
+int spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
+		    void *payload, uint64_t offset, uint64_t length);
 /**
  * Read data to user buffer from the given file.
  *
@@ -360,6 +362,8 @@ int spdk_file_write(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 int64_t spdk_file_read(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		       void *payload, uint64_t offset, uint64_t length);
 
+int64_t spdk_file_read_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
+		       void *payload, uint64_t offset, uint64_t length);
 /**
  * Set cache size for the blobstore filesystem.
  *

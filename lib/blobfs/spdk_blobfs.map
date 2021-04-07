@@ -22,7 +22,9 @@
 	spdk_file_get_name;
 	spdk_file_get_length;
 	spdk_file_write;
+	spdk_file_write_ms;
 	spdk_file_read;
+	spdk_file_read_ms;
 	spdk_fs_set_cache_size;
 	spdk_fs_get_cache_size;
 	spdk_file_set_priority;

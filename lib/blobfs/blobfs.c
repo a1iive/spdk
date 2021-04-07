@@ -2446,6 +2446,33 @@ __send_rw_from_file(struct spdk_file *file, void *payload,
 }
 
 int
+spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
+		void *payload, uint64_t offset, uint64_t length)
+{
+	struct spdk_fs_channel *channel = (struct spdk_fs_channel *)ctx;
+	BLOBFS_TRACE_RW(file, "offset=%jx length=%jx\n", offset, length);
+
+	if (length == 0) {
+		return 0;
+	}
+	pthread_spin_lock(&file->lock);
+	file->open_for_writing = true;
+	struct rw_from_file_arg arg = {};
+	int rc;
+
+	arg.channel = channel;
+	arg.rwerrno = 0;
+	file->append_pos += length;
+	pthread_spin_unlock(&file->lock);
+	rc = __send_rw_from_file(file, payload, offset, length, false, &arg);
+	if (rc != 0) {
+		return rc;
+	}
+	sem_wait(&channel->sem);
+	return arg.rwerrno;
+}
+
+int
 spdk_file_write(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		void *payload, uint64_t offset, uint64_t length)
 {
@@ -2638,6 +2665,35 @@ check_readahead(struct spdk_file *file, uint64_t offset,
 		args->op.readahead.length = CACHE_BUFFER_SIZE;
 	}
 	file->fs->send_request(__readahead, req);
+}
+
+int64_t
+spdk_file_read_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
+	       void *payload, uint64_t offset, uint64_t length)
+{
+	struct spdk_fs_channel *channel = (struct spdk_fs_channel *)ctx;
+	int rc;
+	struct rw_from_file_arg arg = {};
+
+	pthread_spin_lock(&file->lock);
+
+	BLOBFS_TRACE_RW(file, "offset=%ju length=%ju\n", offset, length);
+
+	file->open_for_writing = false;
+	arg.channel = channel;
+	arg.rwerrno = 0;
+	pthread_spin_unlock(&file->lock);
+	rc = __send_rw_from_file(file, payload, offset, length, true, &arg);
+	if (rc != 0) {
+		return rc;
+	}
+	sem_wait(&channel->sem);
+	// TODO: sub_reads
+	if (arg.rwerrno == 0) {
+		return length;
+	} else {
+		return arg.rwerrno;
+	}
 }
 
 int64_t
