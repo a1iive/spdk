@@ -170,6 +170,8 @@ struct spdk_filesystem {
 };
 
 struct spdk_fs_cb_args {
+	/** NOTE huhaosheng declared */
+	uint32_t vstream_id;
 	union {
 		spdk_fs_op_with_handle_complete		fs_op_with_handle;
 		spdk_fs_op_complete			fs_op;
@@ -628,7 +630,8 @@ spdk_fs_init(struct spdk_bs_dev *dev, struct spdk_blobfs_opts *opt,
 	if (opt) {
 		opts.cluster_sz = opt->cluster_sz;
 	}
-	spdk_bs_init(dev, &opts, init_cb, req);
+	// NOTE huhaosheng changed
+	spdk_bs_init_ms(dev, &opts, init_cb, req);
 }
 
 static struct spdk_file *
@@ -868,7 +871,8 @@ spdk_fs_load(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn,
 	spdk_bs_opts_init(&bs_opts, sizeof(bs_opts));
 	bs_opts.iter_cb_fn = iter_cb;
 	bs_opts.iter_cb_arg = req;
-	spdk_bs_load(dev, &bs_opts, load_cb, req);
+	// NOTE huhaosheng changed
+	spdk_bs_load_ms(dev, &bs_opts, load_cb, req);
 }
 
 static void
@@ -1762,6 +1766,29 @@ _copy_buf_to_iovs(struct iovec *iovs, int iovcnt, void *buf, size_t buf_len)
 	}
 }
 
+// NOTE huhaosheng defined
+static void
+__read_done_ms(void *ctx, int bserrno)
+{
+	struct spdk_fs_request *req = ctx;
+	struct spdk_fs_cb_args *args = &req->args;
+	uint64_t vstream_id = args->vstream_id;
+	void *buf;
+
+	assert(req != NULL);
+	buf = (void *)((uintptr_t)args->op.rw.pin_buf + (args->op.rw.offset & (args->op.rw.blocklen - 1)));
+	if (args->op.rw.is_read) {
+		_copy_buf_to_iovs(args->iovs, args->iovcnt, buf, args->op.rw.length);
+		__rw_done(req, 0);
+	} else {
+		_copy_iovs_to_buf(buf, args->op.rw.length, args->iovs, args->iovcnt);
+		spdk_blob_io_write_ms(args->file->blob, args->op.rw.channel,
+				   args->op.rw.pin_buf,
+				   args->op.rw.start_lba, args->op.rw.num_lba, vstream_id,
+				   __rw_done, req);
+	}
+}
+
 static void
 __read_done(void *ctx, int bserrno)
 {
@@ -1781,6 +1808,23 @@ __read_done(void *ctx, int bserrno)
 				   args->op.rw.start_lba, args->op.rw.num_lba,
 				   __rw_done, req);
 	}
+}
+
+// NOTE huhaosheng defined
+static void
+__do_blob_read_ms(void *ctx, int fserrno)
+{
+	struct spdk_fs_request *req = ctx;
+	struct spdk_fs_cb_args *args = &req->args;
+
+	if (fserrno) {
+		__rw_done(req, fserrno);
+		return;
+	}
+	spdk_blob_io_read(args->file->blob, args->op.rw.channel,
+			  args->op.rw.pin_buf,
+			  args->op.rw.start_lba, args->op.rw.num_lba,
+			  __read_done_ms, req);
 }
 
 static void
@@ -1831,6 +1875,74 @@ _fs_request_setup_iovs(struct spdk_fs_request *req, struct iovec *iovs, uint32_t
 	for (i = 0; i < iovcnt; i++) {
 		req->args.iovs[i].iov_base = iovs[i].iov_base;
 		req->args.iovs[i].iov_len = iovs[i].iov_len;
+	}
+}
+
+// NOTE huhaosheng defined
+static void
+__readvwritev_ms(struct spdk_file *file, struct spdk_io_channel *_channel,
+	      struct iovec *iovs, uint32_t iovcnt, uint64_t offset, uint64_t length, uint32_t vstream_id,
+	      spdk_file_op_complete cb_fn, void *cb_arg, int is_read)
+{
+	struct spdk_fs_request *req;
+	struct spdk_fs_cb_args *args;
+	struct spdk_fs_channel *channel = spdk_io_channel_get_ctx(_channel);
+	uint64_t start_lba, num_lba, pin_buf_length;
+	uint32_t lba_size;
+
+	if (is_read && offset + length > file->length) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+
+	req = alloc_fs_request_with_iov(channel, iovcnt);
+	if (req == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	__get_page_parameters(file, offset, length, &start_lba, &lba_size, &num_lba);
+
+	args = &req->args;
+	args->fn.file_op = cb_fn;
+	args->arg = cb_arg;
+	args->file = file;
+	args->op.rw.channel = channel->bs_channel;
+	_fs_request_setup_iovs(req, iovs, iovcnt);
+	args->op.rw.is_read = is_read;
+	args->op.rw.offset = offset;
+	args->op.rw.blocklen = lba_size;
+
+	pin_buf_length = num_lba * lba_size;
+	args->op.rw.length = pin_buf_length;
+	args->op.rw.pin_buf = spdk_malloc(pin_buf_length, lba_size, NULL,
+					  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (args->op.rw.pin_buf == NULL) {
+		SPDK_DEBUGLOG(blobfs, "Failed to allocate buf for: file=%s offset=%jx length=%jx\n",
+			      file->name, offset, length);
+		free_fs_request(req);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	args->op.rw.start_lba = start_lba;
+	args->op.rw.num_lba = num_lba;
+
+	args->vstream_id = vstream_id;
+
+	if (!is_read && file->length < offset + length) {
+		// NOTE huhaosheng changed 
+		spdk_file_truncate_async(file, offset + length, __do_blob_read_ms, req);
+	} else if (!is_read && __is_lba_aligned(file, offset, length)) {
+		_copy_iovs_to_buf(args->op.rw.pin_buf, args->op.rw.length, args->iovs, args->iovcnt);
+		// NOTE huhaosheng changed
+		spdk_blob_io_write_ms(args->file->blob, args->op.rw.channel,
+				   args->op.rw.pin_buf,
+				   args->op.rw.start_lba, args->op.rw.num_lba, vstream_id,
+				   __rw_done, req);
+	} else {
+		// NOTE huhaosheng changed
+		__do_blob_read_ms(req, 0);
 	}
 }
 
@@ -1896,6 +2008,20 @@ __readvwritev(struct spdk_file *file, struct spdk_io_channel *_channel,
 	}
 }
 
+// NOTE huhaosheng defined
+static void
+__readwrite_ms(struct spdk_file *file, struct spdk_io_channel *channel,
+	    void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+	    spdk_file_op_complete cb_fn, void *cb_arg, int is_read)
+{
+	struct iovec iov;
+
+	iov.iov_base = payload;
+	iov.iov_len = (size_t)length;
+
+	__readvwritev_ms(file, channel, &iov, 1, offset, length, vstream_id, cb_fn, cb_arg, is_read);
+}
+
 static void
 __readwrite(struct spdk_file *file, struct spdk_io_channel *channel,
 	    void *payload, uint64_t offset, uint64_t length,
@@ -1907,6 +2033,15 @@ __readwrite(struct spdk_file *file, struct spdk_io_channel *channel,
 	iov.iov_len = (size_t)length;
 
 	__readvwritev(file, channel, &iov, 1, offset, length, cb_fn, cb_arg, is_read);
+}
+
+// NOTE huhaosheng defined
+void
+spdk_file_write_async_ms(struct spdk_file *file, struct spdk_io_channel *channel,
+		      void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+		      spdk_file_op_complete cb_fn, void *cb_arg)
+{
+	__readwrite_ms(file, channel, payload, offset, length, vstream_id, cb_fn, cb_arg, 0);
 }
 
 void
@@ -2396,6 +2531,25 @@ __rw_from_file_done(void *ctx, int bserrno)
 	free_fs_request(req);
 }
 
+// NOTE huhaosheng defined
+static void
+__rw_from_file_ms(void *ctx)
+{
+	struct spdk_fs_request *req = ctx;
+	struct spdk_fs_cb_args *args = &req->args;
+	struct spdk_file *file = args->file;
+
+	if (args->op.rw.is_read) {
+		spdk_file_read_async(file, file->fs->sync_target.sync_io_channel, args->iovs[0].iov_base,
+				     args->op.rw.offset, (uint64_t)args->iovs[0].iov_len,
+				     __rw_from_file_done, req);
+	} else {
+		spdk_file_write_async_ms(file, file->fs->sync_target.sync_io_channel, args->iovs[0].iov_base,
+				      args->op.rw.offset, (uint64_t)args->iovs[0].iov_len, args->vstream_id,
+				      __rw_from_file_done, req);
+	}
+}
+
 static void
 __rw_from_file(void *ctx)
 {
@@ -2418,6 +2572,35 @@ struct rw_from_file_arg {
 	struct spdk_fs_channel *channel;
 	int rwerrno;
 };
+
+// NOTE huhaosheng defined
+static int
+__send_rw_from_file_ms(struct spdk_file *file, void *payload,
+		    uint64_t offset, uint64_t length, bool is_read, uint32_t vstream_id,
+		    struct rw_from_file_arg *arg)
+{
+	struct spdk_fs_request *req;
+	struct spdk_fs_cb_args *args;
+
+	req = alloc_fs_request_with_iov(arg->channel, 1);
+	if (req == NULL) {
+		sem_post(&arg->channel->sem);
+		return -ENOMEM;
+	}
+
+	args = &req->args;
+	args->file = file;
+	args->sem = &arg->channel->sem;
+	args->iovs[0].iov_base = payload;
+	args->iovs[0].iov_len = (size_t)length;
+	args->op.rw.offset = offset;
+	args->op.rw.is_read = is_read;
+	args->rwerrno = &arg->rwerrno;
+	// NOTE huhaosheng declared
+	args->vstream_id = vstream_id;
+	file->fs->send_request(__rw_from_file_ms, req);
+	return 0;
+}
 
 static int
 __send_rw_from_file(struct spdk_file *file, void *payload,
@@ -2445,8 +2628,9 @@ __send_rw_from_file(struct spdk_file *file, void *payload,
 	return 0;
 }
 
+// NOTE huhaosheng defined
 int
-spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
+spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx, uint32_t vstream_id,
 		void *payload, uint64_t offset, uint64_t length)
 {
 	struct spdk_fs_channel *channel = (struct spdk_fs_channel *)ctx;
@@ -2464,7 +2648,7 @@ spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 	arg.rwerrno = 0;
 	file->append_pos += length;
 	pthread_spin_unlock(&file->lock);
-	rc = __send_rw_from_file(file, payload, offset, length, false, &arg);
+	rc = __send_rw_from_file_ms(file, payload, offset, length, false, vstream_id, &arg);
 	if (rc != 0) {
 		return rc;
 	}
@@ -2667,6 +2851,7 @@ check_readahead(struct spdk_file *file, uint64_t offset,
 	file->fs->send_request(__readahead, req);
 }
 
+// NOTE huhaosheng defined
 int64_t
 spdk_file_read_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 	       void *payload, uint64_t offset, uint64_t length)

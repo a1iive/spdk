@@ -358,6 +358,22 @@ bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 			    &set->cb_args);
 }
 
+// NOTE huhaosheng defined
+void
+bs_batch_write_dev_ms(spdk_bs_batch_t *batch, void *payload,
+		   uint64_t lba, uint32_t lba_count, uint32_t pstream_id)
+{
+	struct spdk_bs_request_set	*set = (struct spdk_bs_request_set *)batch;
+	struct spdk_bs_channel		*channel = set->channel;
+
+	SPDK_DEBUGLOG(blob_rw, "Writing %" PRIu32 " blocks to LBA %" PRIu64 "\n", lba_count, lba);
+
+	set->u.batch.outstanding_ops++;
+	// NOTE denghejian use wiret_ms
+	channel->dev->write_ms(channel->dev, channel->dev_channel, payload, lba, lba_count, pstream_id,
+			    &set->cb_args);
+}
+
 void
 bs_batch_unmap_dev(spdk_bs_batch_t *batch,
 		   uint64_t lba, uint32_t lba_count)

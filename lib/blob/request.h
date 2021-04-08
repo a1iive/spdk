@@ -192,6 +192,10 @@ void bs_batch_read_dev(spdk_bs_batch_t *batch, void *payload,
 void bs_batch_write_dev(spdk_bs_batch_t *batch, void *payload,
 			uint64_t lba, uint32_t lba_count);
 
+// NOTE denghejian declare bs_batch_write_dev_ms
+void bs_batch_write_dev_ms(spdk_bs_batch_t *batch, void *payload,
+			uint64_t lba, uint32_t lba_count, uint32_t pstream_id);
+
 void bs_batch_unmap_dev(spdk_bs_batch_t *batch,
 			uint64_t lba, uint32_t lba_count);
 

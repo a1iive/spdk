@@ -58,6 +58,7 @@
 	spdk_bdev_readv_blocks_with_md;
 	spdk_bdev_write;
 	spdk_bdev_write_blocks;
+	spdk_bdev_write_blocks_ms;
 	spdk_bdev_write_blocks_with_md;
 	spdk_bdev_writev;
 	spdk_bdev_writev_blocks;

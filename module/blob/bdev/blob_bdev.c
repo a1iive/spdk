@@ -142,6 +142,25 @@ bdev_blob_read(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *p
 	}
 }
 
+// NOTE denghejian defined
+static void
+bdev_blob_write_ms(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
+		uint64_t lba, uint32_t lba_count, uint32_t pstream_id, struct spdk_bs_dev_cb_args *cb_args)
+{
+	int rc;
+
+	// NOTE denghejian changed
+	rc = spdk_bdev_write_blocks_ms(__get_desc(dev), channel, payload, lba,
+				    lba_count, pstream_id, bdev_blob_io_complete, cb_args);
+	if (rc == -ENOMEM) {
+		// TODO maybe need change
+		bdev_blob_queue_io(dev, channel, payload, 0, lba,
+				   lba_count, SPDK_BDEV_IO_TYPE_WRITE, cb_args);
+	} else if (rc != 0) {
+		cb_args->cb_fn(cb_args->channel, cb_args->cb_arg, rc);
+	}
+}
+
 static void
 bdev_blob_write(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
 		uint64_t lba, uint32_t lba_count, struct spdk_bs_dev_cb_args *cb_args)
@@ -342,6 +361,8 @@ blob_bdev_init(struct blob_bdev *b, struct spdk_bdev_desc *desc)
 	b->bs_dev.destroy = bdev_blob_destroy;
 	b->bs_dev.read = bdev_blob_read;
 	b->bs_dev.write = bdev_blob_write;
+	// NOTE huhaosheng declared write_ms
+	b->bs_dev.write_ms = bdev_blob_write_ms;
 	b->bs_dev.readv = bdev_blob_readv;
 	b->bs_dev.writev = bdev_blob_writev;
 	b->bs_dev.write_zeroes = bdev_blob_write_zeroes;

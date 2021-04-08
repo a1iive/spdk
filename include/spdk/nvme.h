@@ -2627,6 +2627,14 @@ int spdk_nvme_ns_cmd_writev_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qp
 				    spdk_nvme_req_next_sge_cb next_sge_fn, void *metadata,
 				    uint16_t apptag_mask, uint16_t apptag);
 
+// NOTE denghejian declare spdk_nvme_ns_cmd_writev_with_md_ms
+int spdk_nvme_ns_cmd_writev_with_md_ms(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+				    uint64_t lba, uint32_t lba_count,
+				    spdk_nvme_cmd_cb cb_fn, void *cb_arg, uint32_t io_flags,
+				    spdk_nvme_req_reset_sgl_cb reset_sgl_fn,
+				    spdk_nvme_req_next_sge_cb next_sge_fn, void *metadata,
+				    uint16_t apptag_mask, uint16_t apptag, uint32_t pstream_id);
+
 /**
  * Submit a write I/O to the specified NVMe namespace.
  *
@@ -2661,6 +2669,12 @@ int spdk_nvme_ns_cmd_write_with_md(struct spdk_nvme_ns *ns, struct spdk_nvme_qpa
 				   void *cb_arg, uint32_t io_flags,
 				   uint16_t apptag_mask, uint16_t apptag);
 
+// NOTE huhaosheng defined
+int spdk_nvme_ns_cmd_write_with_md_ms(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+				   void *payload, void *metadata,
+				   uint64_t lba, uint32_t lba_count, spdk_nvme_cmd_cb cb_fn,
+				   void *cb_arg, uint32_t io_flags,
+				   uint16_t apptag_mask, uint16_t apptag, uint32_t pstream_id);
 /**
  * Submit a write zeroes I/O to the specified NVMe namespace.
  *

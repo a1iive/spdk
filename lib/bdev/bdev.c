@@ -1905,6 +1905,39 @@ bdev_io_do_submit(struct spdk_bdev_channel *bdev_ch, struct spdk_bdev_io *bdev_i
 	}
 }
 
+// NOTE denghejian define bdev_io_do_submit_ms
+static inline void
+bdev_io_do_submit_ms(struct spdk_bdev_channel *bdev_ch, struct spdk_bdev_io *bdev_io, uint32_t pstream_id)
+{
+	struct spdk_bdev *bdev = bdev_io->bdev;
+	struct spdk_io_channel *ch = bdev_ch->channel;
+	struct spdk_bdev_shared_resource *shared_resource = bdev_ch->shared_resource;
+
+	if (spdk_unlikely(bdev_io->type == SPDK_BDEV_IO_TYPE_ABORT)) {
+		struct spdk_bdev_mgmt_channel *mgmt_channel = shared_resource->mgmt_ch;
+		struct spdk_bdev_io *bio_to_abort = bdev_io->u.abort.bio_to_abort;
+
+		if (bdev_abort_queued_io(&shared_resource->nomem_io, bio_to_abort) ||
+		    bdev_abort_buf_io(&mgmt_channel->need_buf_small, bio_to_abort) ||
+		    bdev_abort_buf_io(&mgmt_channel->need_buf_large, bio_to_abort)) {
+			_bdev_io_complete_in_submit(bdev_ch, bdev_io,
+						    SPDK_BDEV_IO_STATUS_SUCCESS);
+			return;
+		}
+	}
+
+	if (spdk_likely(TAILQ_EMPTY(&shared_resource->nomem_io))) {
+		bdev_ch->io_outstanding++;
+		shared_resource->io_outstanding++;
+		bdev_io->internal.in_submit_request = true;
+		// NOTE denghejian use submit_request_ms
+		bdev->fn_table->submit_request_ms(ch, bdev_io, pstream_id);
+		bdev_io->internal.in_submit_request = false;
+	} else {
+		TAILQ_INSERT_TAIL(&shared_resource->nomem_io, bdev_io, internal.link);
+	}
+}
+
 static int
 bdev_qos_io_submit(struct spdk_bdev_channel *ch, struct spdk_bdev_qos *qos)
 {
@@ -2317,6 +2350,44 @@ _bdev_io_submit(void *ctx)
 	}
 }
 
+// NOTE denghejian define _bdev_io_submit_ms
+static inline void
+_bdev_io_submit_ms(void *ctx)
+{
+	struct spdk_bdev_io *bdev_io = ctx;
+	struct spdk_bdev *bdev = bdev_io->bdev;
+	struct spdk_bdev_channel *bdev_ch = bdev_io->internal.ch;
+	// NOTE huhaosheng defined
+	uint32_t pstream_id = bdev_io->pstream_id;
+	
+	uint64_t tsc;
+
+	tsc = spdk_get_ticks();
+	bdev_io->internal.submit_tsc = tsc;
+	spdk_trace_record_tsc(tsc, TRACE_BDEV_IO_START, 0, 0, (uintptr_t)bdev_io, bdev_io->type);
+
+	if (spdk_likely(bdev_ch->flags == 0)) {
+		// NOTE denghejian use bdev_io_do_submit_ms
+		bdev_io_do_submit_ms(bdev_ch, bdev_io, pstream_id);
+		return;
+	}
+
+	if (bdev_ch->flags & BDEV_CH_RESET_IN_PROGRESS) {
+		_bdev_io_complete_in_submit(bdev_ch, bdev_io, SPDK_BDEV_IO_STATUS_ABORTED);
+	} else if (bdev_ch->flags & BDEV_CH_QOS_ENABLED) {
+		if (spdk_unlikely(bdev_io->type == SPDK_BDEV_IO_TYPE_ABORT) &&
+		    bdev_abort_queued_io(&bdev->internal.qos->queued, bdev_io->u.abort.bio_to_abort)) {
+			_bdev_io_complete_in_submit(bdev_ch, bdev_io, SPDK_BDEV_IO_STATUS_SUCCESS);
+		} else {
+			TAILQ_INSERT_TAIL(&bdev->internal.qos->queued, bdev_io, internal.link);
+			bdev_qos_io_submit(bdev_ch, bdev->internal.qos);
+		}
+	} else {
+		SPDK_ERRLOG("unknown bdev_ch flag %x found\n", bdev_ch->flags);
+		_bdev_io_complete_in_submit(bdev_ch, bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+	}
+}
+
 bool
 bdev_lba_range_overlapped(struct lba_range *range1, struct lba_range *range2);
 
@@ -2415,6 +2486,57 @@ bdev_io_submit(struct spdk_bdev_io *bdev_io)
 		}
 	} else {
 		_bdev_io_submit(bdev_io);
+	}
+}
+
+// NOTE denghejian define bdev_io_submit_ms
+void
+bdev_io_submit_ms(struct spdk_bdev_io *bdev_io, uint32_t pstream_id)
+{
+	struct spdk_bdev *bdev = bdev_io->bdev;
+	struct spdk_thread *thread = spdk_bdev_io_get_thread(bdev_io);
+	struct spdk_bdev_channel *ch = bdev_io->internal.ch;
+
+	assert(thread != NULL);
+	assert(bdev_io->internal.status == SPDK_BDEV_IO_STATUS_PENDING);
+
+	if (!TAILQ_EMPTY(&ch->locked_ranges)) {
+		struct lba_range *range;
+
+		TAILQ_FOREACH(range, &ch->locked_ranges, tailq) {
+			if (bdev_io_range_is_locked(bdev_io, range)) {
+				TAILQ_INSERT_TAIL(&ch->io_locked, bdev_io, internal.ch_link);
+				return;
+			}
+		}
+	}
+
+	TAILQ_INSERT_TAIL(&ch->io_submitted, bdev_io, internal.ch_link);
+
+	if (bdev_io_should_split(bdev_io)) {
+		// TODO : when run in this branch
+		bdev_io->internal.submit_tsc = spdk_get_ticks();
+		spdk_trace_record_tsc(bdev_io->internal.submit_tsc, TRACE_BDEV_IO_START, 0, 0,
+				      (uintptr_t)bdev_io, bdev_io->type);
+		bdev_io_split(NULL, bdev_io);
+		return;
+	}
+	// NOTE huhaosheng defined
+	bdev_io->pstream_id = pstream_id;
+
+	if (ch->flags & BDEV_CH_QOS_ENABLED) {
+		if ((thread == bdev->internal.qos->thread) || !bdev->internal.qos->thread) {
+			// NOTE denghejian use _bdev_io_submit_ms
+			_bdev_io_submit_ms(bdev_io);
+		} else {
+			bdev_io->internal.io_submit_ch = ch;
+			bdev_io->internal.ch = bdev->internal.qos->ch;
+			// NOTE huhaosheng changed
+			spdk_thread_send_msg(bdev->internal.qos->thread, _bdev_io_submit_ms, bdev_io);
+		}
+	} else {
+		// NOTE denghejian use _bdev_io_submit_ms
+		_bdev_io_submit_ms(bdev_io);
 	}
 }
 
@@ -3718,6 +3840,46 @@ bdev_write_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_channel *c
 	return 0;
 }
 
+// NOTE denghejian define bdev_write_blocks_with_md_ms
+static int
+bdev_write_blocks_with_md_ms(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			  void *buf, void *md_buf, uint64_t offset_blocks, uint64_t num_blocks, uint32_t pstream_id,
+			  spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	struct spdk_bdev *bdev = spdk_bdev_desc_get_bdev(desc);
+	struct spdk_bdev_io *bdev_io;
+	struct spdk_bdev_channel *channel = spdk_io_channel_get_ctx(ch);
+
+	if (!desc->write) {
+		return -EBADF;
+	}
+
+	if (!bdev_io_valid_blocks(bdev, offset_blocks, num_blocks)) {
+		return -EINVAL;
+	}
+
+	bdev_io = bdev_channel_get_io(channel);
+	if (!bdev_io) {
+		return -ENOMEM;
+	}
+
+	bdev_io->internal.ch = channel;
+	bdev_io->internal.desc = desc;
+	bdev_io->type = SPDK_BDEV_IO_TYPE_WRITE;
+	bdev_io->u.bdev.iovs = &bdev_io->iov;
+	bdev_io->u.bdev.iovs[0].iov_base = buf;
+	bdev_io->u.bdev.iovs[0].iov_len = num_blocks * bdev->blocklen;
+	bdev_io->u.bdev.iovcnt = 1;
+	bdev_io->u.bdev.md_buf = md_buf;
+	bdev_io->u.bdev.num_blocks = num_blocks;
+	bdev_io->u.bdev.offset_blocks = offset_blocks;
+	bdev_io_init(bdev_io, bdev, cb_arg, cb);
+
+	// NOTE denghejian use bdev_io_submit_ms
+	bdev_io_submit_ms(bdev_io, pstream_id);
+	return 0;
+}
+
 int
 spdk_bdev_write(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		void *buf, uint64_t offset, uint64_t nbytes,
@@ -3739,6 +3901,17 @@ spdk_bdev_write_blocks(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
 		       spdk_bdev_io_completion_cb cb, void *cb_arg)
 {
 	return bdev_write_blocks_with_md(desc, ch, buf, NULL, offset_blocks, num_blocks,
+					 cb, cb_arg);
+}
+
+// NOTE denghejian define spdk_bdev_write_blocks_ms
+int
+spdk_bdev_write_blocks_ms(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+		       void *buf, uint64_t offset_blocks, uint64_t num_blocks, uint32_t pstream_id,
+		       spdk_bdev_io_completion_cb cb, void *cb_arg)
+{
+	// NOTE denghejian use bdev_write_blocks_with_md_ms
+	return bdev_write_blocks_with_md_ms(desc, ch, buf, NULL, offset_blocks, num_blocks, pstream_id,
 					 cb, cb_arg);
 }
 

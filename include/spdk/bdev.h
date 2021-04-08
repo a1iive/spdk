@@ -905,6 +905,11 @@ int spdk_bdev_readv_blocks_with_md(struct spdk_bdev_desc *desc, struct spdk_io_c
 				   uint64_t offset_blocks, uint64_t num_blocks,
 				   spdk_bdev_io_completion_cb cb, void *cb_arg);
 
+// NOTE denghejian declare spdk_bdev_write_blocks_ms
+int spdk_bdev_write_blocks_ms(struct spdk_bdev_desc *desc, struct spdk_io_channel *ch,
+			   void *buf, uint64_t offset_blocks, uint64_t num_blocks, uint32_t pstream_id,
+			   spdk_bdev_io_completion_cb cb, void *cb_arg);
+
 /**
  * Submit a write request to the bdev on the given channel.
  *

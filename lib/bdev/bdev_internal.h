@@ -47,4 +47,7 @@ void bdev_io_init(struct spdk_bdev_io *bdev_io, struct spdk_bdev *bdev, void *cb
 
 void bdev_io_submit(struct spdk_bdev_io *bdev_io);
 
+// NOTE denghejian declare bdev_io_submit_ms
+void bdev_io_submit_ms(struct spdk_bdev_io *bdev_io, uint32_t pstream_id);
+
 #endif /* SPDK_BDEV_INTERNAL_H */

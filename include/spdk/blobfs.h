@@ -158,6 +158,10 @@ void spdk_fs_init(struct spdk_bs_dev *dev, struct spdk_blobfs_opts *opt,
 void spdk_fs_load(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn,
 		  spdk_fs_op_with_handle_complete cb_fn, void *cb_arg);
 
+// NOTE huhaosheng declare spdk_fs_load_ms
+void spdk_fs_load_ms(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn,
+		  spdk_fs_op_with_handle_complete cb_fn, void *cb_arg);
+
 /**
  * Unload blobstore filesystem.
  *
@@ -346,8 +350,10 @@ uint64_t spdk_file_get_length(struct spdk_file *file);
 int spdk_file_write(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		    void *payload, uint64_t offset, uint64_t length);
 
-int spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
+// NOTE huhaosheng declared
+int spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx, uint32_t vstream_id,
 		    void *payload, uint64_t offset, uint64_t length);
+
 /**
  * Read data to user buffer from the given file.
  *
@@ -560,6 +566,11 @@ void spdk_file_truncate_async(struct spdk_file *file, uint64_t length,
  */
 void spdk_file_write_async(struct spdk_file *file, struct spdk_io_channel *channel,
 			   void *payload, uint64_t offset, uint64_t length,
+			   spdk_file_op_complete cb_fn, void *cb_arg);
+
+// NOTE denghejian declare spdk_file_write_async_ms
+void spdk_file_write_async_ms(struct spdk_file *file, struct spdk_io_channel *channel,
+			   void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
 			   spdk_file_op_complete cb_fn, void *cb_arg);
 
 /**

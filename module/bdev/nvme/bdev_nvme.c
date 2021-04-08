@@ -148,6 +148,11 @@ static int bdev_nvme_writev(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpa
 			    struct nvme_bdev_io *bio,
 			    struct iovec *iov, int iovcnt, void *md, uint64_t lba_count, uint64_t lba,
 			    uint32_t flags);
+// NOTE denghejian declared
+static int bdev_nvme_writev_ms(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+			    struct nvme_bdev_io *bio,
+			    struct iovec *iov, int iovcnt, void *md, uint64_t lba_count, uint64_t lba,
+			    uint32_t flags, uint32_t pstream_id);
 static int bdev_nvme_comparev(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 			      struct nvme_bdev_io *bio,
 			      struct iovec *iov, int iovcnt, void *md, uint64_t lba_count, uint64_t lba,
@@ -659,6 +664,138 @@ bdev_nvme_get_buf_cb(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io,
 	}
 }
 
+// NOTE denghejian defined
+static int
+_bdev_nvme_submit_request_ms(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, uint32_t pstream_id)
+{
+	struct nvme_io_channel *nvme_ch = spdk_io_channel_get_ctx(ch);
+	struct spdk_bdev *bdev = bdev_io->bdev;
+	struct nvme_bdev *nbdev = (struct nvme_bdev *)bdev->ctxt;
+	struct nvme_bdev_io *nbdev_io = (struct nvme_bdev_io *)bdev_io->driver_ctx;
+	struct nvme_bdev_io *nbdev_io_to_abort;
+	struct nvme_bdev_ns *nvme_ns;
+	struct spdk_nvme_qpair *qpair;
+
+	if (spdk_unlikely(!bdev_nvme_find_io_path(nbdev, nvme_ch, &nvme_ns, &qpair))) {
+		return -1;
+	}
+
+	switch (bdev_io->type) {
+	case SPDK_BDEV_IO_TYPE_READ:
+		if (bdev_io->u.bdev.iovs && bdev_io->u.bdev.iovs[0].iov_base) {
+			return bdev_nvme_readv(nvme_ns->ns,
+					       qpair,
+					       nbdev_io,
+					       bdev_io->u.bdev.iovs,
+					       bdev_io->u.bdev.iovcnt,
+					       bdev_io->u.bdev.md_buf,
+					       bdev_io->u.bdev.num_blocks,
+					       bdev_io->u.bdev.offset_blocks,
+					       bdev->dif_check_flags);
+		} else {
+			spdk_bdev_io_get_buf(bdev_io, bdev_nvme_get_buf_cb,
+					     bdev_io->u.bdev.num_blocks * bdev->blocklen);
+			return 0;
+		}
+
+	case SPDK_BDEV_IO_TYPE_WRITE:
+		// NOTE denghejian changed
+		return bdev_nvme_writev_ms(nvme_ns->ns,
+					qpair,
+					nbdev_io,
+					bdev_io->u.bdev.iovs,
+					bdev_io->u.bdev.iovcnt,
+					bdev_io->u.bdev.md_buf,
+					bdev_io->u.bdev.num_blocks,
+					bdev_io->u.bdev.offset_blocks,
+					bdev->dif_check_flags,
+					pstream_id);
+
+	case SPDK_BDEV_IO_TYPE_COMPARE:
+		return bdev_nvme_comparev(nvme_ns->ns,
+					  qpair,
+					  nbdev_io,
+					  bdev_io->u.bdev.iovs,
+					  bdev_io->u.bdev.iovcnt,
+					  bdev_io->u.bdev.md_buf,
+					  bdev_io->u.bdev.num_blocks,
+					  bdev_io->u.bdev.offset_blocks,
+					  bdev->dif_check_flags);
+
+	case SPDK_BDEV_IO_TYPE_COMPARE_AND_WRITE:
+		return bdev_nvme_comparev_and_writev(nvme_ns->ns,
+						     qpair,
+						     nbdev_io,
+						     bdev_io->u.bdev.iovs,
+						     bdev_io->u.bdev.iovcnt,
+						     bdev_io->u.bdev.fused_iovs,
+						     bdev_io->u.bdev.fused_iovcnt,
+						     bdev_io->u.bdev.md_buf,
+						     bdev_io->u.bdev.num_blocks,
+						     bdev_io->u.bdev.offset_blocks,
+						     bdev->dif_check_flags);
+
+	case SPDK_BDEV_IO_TYPE_WRITE_ZEROES:
+		return bdev_nvme_unmap(nvme_ns->ns,
+				       qpair,
+				       nbdev_io,
+				       bdev_io->u.bdev.offset_blocks,
+				       bdev_io->u.bdev.num_blocks);
+
+	case SPDK_BDEV_IO_TYPE_UNMAP:
+		return bdev_nvme_unmap(nvme_ns->ns,
+				       qpair,
+				       nbdev_io,
+				       bdev_io->u.bdev.offset_blocks,
+				       bdev_io->u.bdev.num_blocks);
+
+	case SPDK_BDEV_IO_TYPE_RESET:
+		return bdev_nvme_reset(nvme_ch, nbdev_io);
+
+	case SPDK_BDEV_IO_TYPE_FLUSH:
+		return bdev_nvme_flush(nvme_ns->ns,
+				       qpair,
+				       nbdev_io,
+				       bdev_io->u.bdev.offset_blocks,
+				       bdev_io->u.bdev.num_blocks);
+
+	case SPDK_BDEV_IO_TYPE_NVME_ADMIN:
+		return bdev_nvme_admin_passthru(nvme_ch,
+						nbdev_io,
+						&bdev_io->u.nvme_passthru.cmd,
+						bdev_io->u.nvme_passthru.buf,
+						bdev_io->u.nvme_passthru.nbytes);
+
+	case SPDK_BDEV_IO_TYPE_NVME_IO:
+		return bdev_nvme_io_passthru(nvme_ns->ns,
+					     qpair,
+					     nbdev_io,
+					     &bdev_io->u.nvme_passthru.cmd,
+					     bdev_io->u.nvme_passthru.buf,
+					     bdev_io->u.nvme_passthru.nbytes);
+
+	case SPDK_BDEV_IO_TYPE_NVME_IO_MD:
+		return bdev_nvme_io_passthru_md(nvme_ns->ns,
+						qpair,
+						nbdev_io,
+						&bdev_io->u.nvme_passthru.cmd,
+						bdev_io->u.nvme_passthru.buf,
+						bdev_io->u.nvme_passthru.nbytes,
+						bdev_io->u.nvme_passthru.md_buf,
+						bdev_io->u.nvme_passthru.md_len);
+
+	case SPDK_BDEV_IO_TYPE_ABORT:
+		nbdev_io_to_abort = (struct nvme_bdev_io *)bdev_io->u.abort.bio_to_abort->driver_ctx;
+		return bdev_nvme_abort(nvme_ch,
+				       nbdev_io,
+				       nbdev_io_to_abort);
+
+	default:
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static int
 _bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io)
 {
@@ -786,6 +923,21 @@ _bdev_nvme_submit_request(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_
 		return -EINVAL;
 	}
 	return 0;
+}
+
+// NOTE denghejian defined
+static void
+bdev_nvme_submit_request_ms(struct spdk_io_channel *ch, struct spdk_bdev_io *bdev_io, uint32_t pstream_id)
+{
+	int rc = _bdev_nvme_submit_request_ms(ch, bdev_io, pstream_id);
+
+	if (spdk_unlikely(rc != 0)) {
+		if (rc == -ENOMEM) {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_NOMEM);
+		} else {
+			spdk_bdev_io_complete(bdev_io, SPDK_BDEV_IO_STATUS_FAILED);
+		}
+	}
 }
 
 static void
@@ -1126,6 +1278,8 @@ bdev_nvme_get_spin_time(struct spdk_io_channel *ch)
 static const struct spdk_bdev_fn_table nvmelib_fn_table = {
 	.destruct		= bdev_nvme_destruct,
 	.submit_request		= bdev_nvme_submit_request,
+	// NOTE denghejian use bdev_nvme_submit_request_ms
+	.submit_request_ms  = bdev_nvme_submit_request_ms,
 	.io_type_supported	= bdev_nvme_io_type_supported,
 	.get_io_channel		= bdev_nvme_get_io_channel,
 	.dump_info_json		= bdev_nvme_dump_info_json,
@@ -2558,6 +2712,43 @@ bdev_nvme_readv(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
 
 	if (rc != 0 && rc != -ENOMEM) {
 		SPDK_ERRLOG("readv failed: rc = %d\n", rc);
+	}
+	return rc;
+}
+
+// NOTE denghejian defined
+static int
+bdev_nvme_writev_ms(struct spdk_nvme_ns *ns, struct spdk_nvme_qpair *qpair,
+		 struct nvme_bdev_io *bio,
+		 struct iovec *iov, int iovcnt, void *md, uint64_t lba_count, uint64_t lba,
+		 uint32_t flags, uint32_t pstream_id)
+{
+	int rc;
+
+	SPDK_DEBUGLOG(bdev_nvme, "write %" PRIu64 " blocks with offset %#" PRIx64 "\n",
+		      lba_count, lba);
+
+	bio->iovs = iov;
+	bio->iovcnt = iovcnt;
+	bio->iovpos = 0;
+	bio->iov_offset = 0;
+
+	// NOTE denghejian changed
+	if (iovcnt == 1) {
+		rc = spdk_nvme_ns_cmd_write_with_md_ms(ns, qpair, iov[0].iov_base, md, lba,
+						    lba_count,
+						    bdev_nvme_writev_done, bio,
+						    flags,
+						    0, 0, pstream_id);
+	} else {
+		rc = spdk_nvme_ns_cmd_writev_with_md_ms(ns, qpair, lba, lba_count,
+						     bdev_nvme_writev_done, bio, flags,
+						     bdev_nvme_queued_reset_sgl, bdev_nvme_queued_next_sge,
+						     md, 0, 0, pstream_id);
+	}
+
+	if (rc != 0 && rc != -ENOMEM) {
+		SPDK_ERRLOG("writev failed: rc = %d\n", rc);
 	}
 	return rc;
 }

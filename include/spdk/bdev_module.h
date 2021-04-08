@@ -184,6 +184,9 @@ struct spdk_bdev_fn_table {
 	/** Process the IO. */
 	void (*submit_request)(struct spdk_io_channel *ch, struct spdk_bdev_io *);
 
+	// NOTE denghejian define 
+	void (*submit_request_ms)(struct spdk_io_channel *ch, struct spdk_bdev_io *, uint32_t pstream_id);
+
 	/** Check if the block device supports a specific I/O type. */
 	bool (*io_type_supported)(void *ctx, enum spdk_bdev_io_type);
 
@@ -488,6 +491,9 @@ typedef void (*spdk_bdev_io_get_aux_buf_cb)(struct spdk_io_channel *ch,
 #define BDEV_IO_NUM_CHILD_IOV 32
 
 struct spdk_bdev_io {
+	/** NOTE huhaosheng declared  */
+	uint32_t pstream_id;
+
 	/** The block device that this I/O belongs to. */
 	struct spdk_bdev *bdev;
 

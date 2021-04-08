@@ -2492,7 +2492,63 @@ struct op_split_ctx {
 	void *curr_payload;
 	enum spdk_blob_op_type op_type;
 	spdk_bs_sequence_t *seq;
+	uint32_t vstream_id;
 };
+
+// NOTE huhaosheng define
+static void
+blob_request_submit_op_split_next_ms(void *cb_arg, int bserrno)
+{
+	struct op_split_ctx	*ctx = cb_arg;
+	struct spdk_blob	*blob = ctx->blob;
+	struct spdk_io_channel	*ch = ctx->channel;
+	enum spdk_blob_op_type	op_type = ctx->op_type;
+	uint8_t			*buf = ctx->curr_payload;
+	uint64_t		offset = ctx->io_unit_offset;
+	uint64_t		length = ctx->io_units_remaining;
+	uint64_t		op_length;
+
+	if (bserrno != 0 || ctx->io_units_remaining == 0) {
+		bs_sequence_finish(ctx->seq, bserrno);
+		free(ctx);
+		return;
+	}
+
+	op_length = spdk_min(length, bs_num_io_units_to_cluster_boundary(blob,
+			     offset));
+
+	/* Update length and payload for next operation */
+	ctx->io_units_remaining -= op_length;
+	ctx->io_unit_offset += op_length;
+	if (op_type == SPDK_BLOB_WRITE || op_type == SPDK_BLOB_READ) {
+		ctx->curr_payload += op_length * blob->bs->io_unit_size;
+	}
+
+	switch (op_type) {
+	case SPDK_BLOB_READ:
+		spdk_blob_io_read(blob, ch, buf, offset, op_length,
+				  blob_request_submit_op_split_next, ctx);
+		break;
+	case SPDK_BLOB_WRITE:
+		spdk_blob_io_write_ms(blob, ch, buf, offset, op_length, ctx->vstream_id,
+				   blob_request_submit_op_split_next_ms, ctx);
+		break;
+	case SPDK_BLOB_UNMAP:
+		spdk_blob_io_unmap(blob, ch, offset, op_length,
+				   blob_request_submit_op_split_next, ctx);
+		break;
+	case SPDK_BLOB_WRITE_ZEROES:
+		spdk_blob_io_write_zeroes(blob, ch, offset, op_length,
+					  blob_request_submit_op_split_next, ctx);
+		break;
+	case SPDK_BLOB_READV:
+	case SPDK_BLOB_WRITEV:
+		SPDK_ERRLOG("readv/write not valid\n");
+		bs_sequence_finish(ctx->seq, -EINVAL);
+		free(ctx);
+		break;
+	}
+}
 
 static void
 blob_request_submit_op_split_next(void *cb_arg, int bserrno)
@@ -2548,6 +2604,47 @@ blob_request_submit_op_split_next(void *cb_arg, int bserrno)
 	}
 }
 
+// NOTE huhaosheng define 
+static void
+blob_request_submit_op_split_ms(struct spdk_io_channel *ch, struct spdk_blob *blob,
+			     void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+			     spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type)
+{
+	struct op_split_ctx *ctx;
+	spdk_bs_sequence_t *seq;
+	struct spdk_bs_cpl cpl;
+
+	assert(blob != NULL);
+
+	ctx = calloc(1, sizeof(struct op_split_ctx));
+	if (ctx == NULL) {
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = cb_fn;
+	cpl.u.blob_basic.cb_arg = cb_arg;
+
+	seq = bs_sequence_start(ch, &cpl);
+	if (!seq) {
+		free(ctx);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	ctx->blob = blob;
+	ctx->channel = ch;
+	ctx->curr_payload = payload;
+	ctx->io_unit_offset = offset;
+	ctx->io_units_remaining = length;
+	ctx->op_type = op_type;
+	ctx->seq = seq;
+	ctx->vstream_id = vstream_id;
+
+	blob_request_submit_op_split_next_ms(ctx, 0);
+}
+
 static void
 blob_request_submit_op_split(struct spdk_io_channel *ch, struct spdk_blob *blob,
 			     void *payload, uint64_t offset, uint64_t length,
@@ -2585,6 +2682,201 @@ blob_request_submit_op_split(struct spdk_io_channel *ch, struct spdk_blob *blob,
 	ctx->seq = seq;
 
 	blob_request_submit_op_split_next(ctx, 0);
+}
+
+// NOTE huhaosheng defined
+/**
+ * update cluster stats and virtual/physical stream stats
+ *
+ * \param lba logic io_unit of total logic address
+ * \param lba_count io_unit counts
+ * \param stream_id the virtual stream id
+ *
+ * \return  // the physical stream id
+ */
+static void 
+blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_count, uint32_t vstream_id) {
+	struct spdk_cluster_stats *cluster_stats;
+	if(blob->bs->cluster_stats == NULL) return;
+	cluster_stats = blob->bs->cluster_stats;
+
+	uint32_t page_start = 0, page_end = 0;
+
+	uint64_t	pages_per_cluster;
+	uint8_t		shift;
+	uint64_t	io_units_per_cluster;
+	uint64_t	io_units_per_page;
+	uint64_t	page;
+
+	pages_per_cluster = blob->bs->pages_per_cluster;
+	shift = blob->bs->pages_per_cluster_shift;
+	io_units_per_page = bs_io_unit_per_page(blob->bs);
+
+	if (shift != 0) {
+		io_units_per_cluster = io_units_per_page << shift;
+	} else {
+		io_units_per_cluster = io_units_per_page * pages_per_cluster;
+	}
+
+	int cluster_index = lba / io_units_per_cluster;
+
+	page = bs_io_unit_to_page(blob->bs, lba);
+	assert(page < blob->bs->total_clusters * pages_per_cluster);
+	page_start = page % pages_per_cluster;
+
+	page = bs_io_unit_to_page(blob->bs, lba+lba_count);
+	assert(page < blob->bs->total_clusters * pages_per_cluster);
+	page_end = page % pages_per_cluster;
+
+	pthread_spin_lock(&(cluster_stats[cluster_index].pages_lock));
+	uint64_t visit_add_nums = 0, evict_add_nums = 0;
+	for(uint32_t i = page_start; i <= page_end; i++) {
+		cluster_stats[cluster_index].visit_nums++;
+		visit_add_nums++;
+		if(spdk_bit_array_get(cluster_stats[cluster_index].pages, i)) {
+			cluster_stats[cluster_index].evict_nums++;
+			evict_add_nums++;
+		} else {
+			spdk_bit_array_set(cluster_stats[cluster_index].pages, i);
+		}
+	}
+	// NOTE: virtual stream mutex first , then physical stream mutex
+	pthread_spin_lock(&(blob->bs->virtual_streams[vstream_id].stream_lock));
+	blob->bs->virtual_streams[vstream_id].total_visit_nums += visit_add_nums;
+	blob->bs->virtual_streams[vstream_id].total_evict_nums += evict_add_nums;
+
+	// TODO : physical stream id == index or index+1
+	uint64_t pstream_id = blob->bs->virtual_streams[vstream_id].physical_stream_id;
+	pthread_spin_lock(&(blob->bs->physical_streams[pstream_id].stream_lock));
+	blob->bs->physical_streams[pstream_id].total_visit_nums += visit_add_nums;
+	blob->bs->physical_streams[pstream_id].total_evict_nums += evict_add_nums;
+	pthread_spin_unlock(&(blob->bs->physical_streams[pstream_id].stream_lock));
+
+	pthread_spin_unlock(&(blob->bs->virtual_streams[vstream_id].stream_lock));
+
+	pthread_spin_unlock(&(cluster_stats[cluster_index].pages_lock));
+}
+
+// NOTE denghejian define blob_request_submit_op_single_ms
+static void
+blob_request_submit_op_single_ms(struct spdk_io_channel *_ch, struct spdk_blob *blob,
+			      void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+			      spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type)
+{
+	struct spdk_bs_cpl cpl;
+	uint64_t lba;
+	uint32_t lba_count;
+	bool is_allocated;
+
+	assert(blob != NULL);
+
+	cpl.type = SPDK_BS_CPL_TYPE_BLOB_BASIC;
+	cpl.u.blob_basic.cb_fn = cb_fn;
+	cpl.u.blob_basic.cb_arg = cb_arg;
+
+	is_allocated = blob_calculate_lba_and_lba_count(blob, offset, length, &lba, &lba_count);
+
+	if (blob->frozen_refcnt) {
+		/* This blob I/O is frozen */
+		spdk_bs_user_op_t *op;
+		struct spdk_bs_channel *bs_channel = spdk_io_channel_get_ctx(_ch);
+
+		op = bs_user_op_alloc(_ch, &cpl, op_type, blob, payload, 0, offset, length);
+		if (!op) {
+			cb_fn(cb_arg, -ENOMEM);
+			return;
+		}
+
+		TAILQ_INSERT_TAIL(&bs_channel->queued_io, op, link);
+
+		return;
+	}
+
+	switch (op_type) {
+	case SPDK_BLOB_READ: {
+		spdk_bs_batch_t *batch;
+
+		batch = bs_batch_open(_ch, &cpl);
+		if (!batch) {
+			cb_fn(cb_arg, -ENOMEM);
+			return;
+		}
+
+		if (is_allocated) {
+			/* Read from the blob */
+			bs_batch_read_dev(batch, payload, lba, lba_count);
+		} else {
+			/* Read from the backing block device */
+			bs_batch_read_bs_dev(batch, blob->back_bs_dev, payload, lba, lba_count);
+		}
+
+		bs_batch_close(batch);
+		break;
+	}
+	case SPDK_BLOB_WRITE:
+	case SPDK_BLOB_WRITE_ZEROES: {
+		if (is_allocated) {
+			/* Write to the blob */
+			spdk_bs_batch_t *batch;
+
+			if (lba_count == 0) {
+				cb_fn(cb_arg, 0);
+				return;
+			}
+
+			batch = bs_batch_open(_ch, &cpl);
+			if (!batch) {
+				cb_fn(cb_arg, -ENOMEM);
+				return;
+			}
+
+			if (op_type == SPDK_BLOB_WRITE) {
+				// NOTE : huhaosheng added
+				blob_update_cluster_stats(blob, lba, lba_count, vstream_id);
+				uint32_t pstream_id = blob_get_pstream_id(blob, vstream_id);
+				// NOTE denghejian use bs_batch_write_dev_ms
+				bs_batch_write_dev_ms(batch, payload, lba, lba_count, pstream_id);
+			} else {
+				bs_batch_write_zeroes_dev(batch, lba, lba_count);
+			}
+
+			bs_batch_close(batch);
+		} else {
+			/* Queue this operation and allocate the cluster */
+			spdk_bs_user_op_t *op;
+
+			op = bs_user_op_alloc(_ch, &cpl, op_type, blob, payload, 0, offset, length);
+			if (!op) {
+				cb_fn(cb_arg, -ENOMEM);
+				return;
+			}
+
+			bs_allocate_and_copy_cluster(blob, _ch, offset, op);
+		}
+		break;
+	}
+	case SPDK_BLOB_UNMAP: {
+		spdk_bs_batch_t *batch;
+
+		batch = bs_batch_open(_ch, &cpl);
+		if (!batch) {
+			cb_fn(cb_arg, -ENOMEM);
+			return;
+		}
+
+		if (is_allocated) {
+			bs_batch_unmap_dev(batch, lba, lba_count);
+		}
+
+		bs_batch_close(batch);
+		break;
+	}
+	case SPDK_BLOB_READV:
+	case SPDK_BLOB_WRITEV:
+		SPDK_ERRLOG("readv/write not valid\n");
+		cb_fn(cb_arg, -EINVAL);
+		break;
+	}
 }
 
 static void
@@ -2701,6 +2993,35 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 		SPDK_ERRLOG("readv/write not valid\n");
 		cb_fn(cb_arg, -EINVAL);
 		break;
+	}
+}
+
+// NOTE denghejian define blob_request_submit_op_ms
+static void
+blob_request_submit_op_ms(struct spdk_blob *blob, struct spdk_io_channel *_channel,
+		       void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+		       spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type)
+{
+	assert(blob != NULL);
+
+	if (blob->data_ro && op_type != SPDK_BLOB_READ) {
+		cb_fn(cb_arg, -EPERM);
+		return;
+	}
+
+	if (offset + length > bs_cluster_to_lba(blob->bs, blob->active.num_clusters)) {
+		cb_fn(cb_arg, -EINVAL);
+		return;
+	}
+	if (length <= bs_num_io_units_to_cluster_boundary(blob, offset)) {
+		// NOTE denghejian use blob_request_submit_op_single_ms
+		blob_request_submit_op_single_ms(_channel, blob, payload, offset, length, vstream_id,
+					      cb_fn, cb_arg, op_type);
+	} else {
+		// NOTE huhaosheng changed
+		// finally invoke blob_request_submit_op_ms
+		blob_request_submit_op_split_ms(_channel, blob, payload, offset, length, vstream_id, 
+					     cb_fn, cb_arg, op_type);
 	}
 }
 
@@ -3064,6 +3385,40 @@ bs_dev_destroy(void *io_device)
 	struct spdk_blob_store *bs = io_device;
 	struct spdk_blob	*blob, *blob_tmp;
 
+	// NOTE: huhaosheng
+	// close pthread first
+	if(bs->stream_upd_tid_set) {
+		pthread_mutex_lock(&bs->stream_upd_mtx);
+		bs->stream_upd_loop = false;
+		pthread_cond_signal(&bs->stream_upd_cond);
+		pthread_mutex_unlock(&bs->stream_upd_mtx);
+		pthread_join(bs->stream_upd_thread_id, NULL);
+
+		pthread_mutex_destroy(&bs->stream_upd_mtx);
+		pthread_cond_destroy(&bs->stream_upd_cond);
+		bs->stream_upd_tid_set = false;
+	}
+
+	if(bs->cluster_stats) {
+		for(uint64_t i = 0; i < bs->total_clusters; i++) {
+			spdk_bit_array_free(&(bs->cluster_stats[i].pages));
+			pthread_spin_destroy(&(bs->cluster_stats[i].pages_lock));
+		}
+		free(bs->cluster_stats);
+	}
+	if(bs->virtual_streams) {
+		for(uint32_t i = 0; i < bs->num_virtual_streams; i++) {
+			pthread_spin_destroy(&(bs->virtual_streams[i].stream_lock));
+		}
+		free(bs->virtual_streams);
+	}
+	if(bs->physical_streams) {
+		for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
+			pthread_spin_destroy(&(bs->physical_streams[i].stream_lock));
+		}
+		free(bs->physical_streams);
+	}
+
 	bs->dev->destroy(bs->dev);
 
 	TAILQ_FOREACH_SAFE(blob, &bs->blobs, link, blob_tmp) {
@@ -3211,6 +3566,9 @@ spdk_bs_opts_init(struct spdk_bs_opts *opts, size_t opts_size)
 	SET_FIELD(num_md_pages, SPDK_BLOB_OPTS_NUM_MD_PAGES);
 	SET_FIELD(max_md_ops, SPDK_BLOB_OPTS_NUM_MD_PAGES);
 	SET_FIELD(max_channel_ops, SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS);
+	// NOTE huhaosheng added
+	SET_FIELD(num_virtual_streams, SPDK_NUM_VIRTUAL_STREAMS);
+	SET_FIELD(num_physical_streams, SPDK_NUM_PHYSICAL_STREAMS);
 	SET_FIELD(clear_method,  BS_CLEAR_WITH_UNMAP);
 
 	if (FIELD_OK(bstype)) {
@@ -3234,6 +3592,101 @@ bs_opts_verify(struct spdk_bs_opts *opts)
 	}
 
 	return 0;
+}
+
+// NOTE huhaosheng defined
+/**
+ * Periodically update virtual stream map to physical stream
+ * in background thread
+ */
+static void *
+bs_stream_update_fn(void *arg) {
+	struct spdk_blob_store * bs = arg;
+	bs->stream_upd_loop = true;
+	struct timespec			ts;
+	uint64_t now, timeout;
+	int rc;
+
+	pthread_mutex_lock(&bs->stream_upd_mtx);
+	while(bs->stream_upd_loop) {
+		
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		now = spdk_get_ticks();
+		timeout = now + (SPDK_STREAM_UPDATE_TIMEOUT * spdk_get_ticks_hz()) / SPDK_SEC_TO_NSEC;
+
+		if (timeout > now) {
+			timeout = ((timeout - now) * SPDK_SEC_TO_NSEC) / spdk_get_ticks_hz() +
+				ts.tv_sec * SPDK_SEC_TO_NSEC + ts.tv_nsec;
+
+			ts.tv_sec  = timeout / SPDK_SEC_TO_NSEC;
+			ts.tv_nsec = timeout % SPDK_SEC_TO_NSEC;
+		}
+		
+		rc = pthread_cond_timedwait((&bs->stream_upd_cond), &bs->stream_upd_mtx, &ts);
+		if (rc != ETIMEDOUT) {
+			break;
+		}
+		if(bs->stream_upd_loop) {
+			/**  Do work */ 
+			// FIRST: calculate and update every physical streams ratio (evict nums / visit nums)
+			for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
+				pthread_spin_lock(&(bs->physical_streams[i].stream_lock));
+				bs->physical_streams[i].ratio = (double)bs->physical_streams[i].total_evict_nums 
+											/ bs->physical_streams[i].total_visit_nums;
+				pthread_spin_unlock(&(bs->physical_streams[i].stream_lock));
+			}
+			// SECOND: re-calculate every virtual streams ratio and find the physical stream 
+			// whose ratio has minimum difference (min diff), 
+			// then change the physical stream mapped by virtual stream if needed
+			double ratio, min_diff, diff;
+			uint32_t new_pstream_id, old_pstream_id;
+			// TODO : 0,1,2 virtual stream is fixed map to 0,1,2 physical stream
+			for(uint32_t i = 3; i < bs->num_virtual_streams; i++) {
+				// NOTE:  physical no lock cuz ratio only modify in this fn before
+				pthread_spin_lock(&(bs->virtual_streams[i].stream_lock));
+				// calculate virtual streams[i] ratio
+				ratio = (double)bs->virtual_streams[i].total_evict_nums \
+					/ bs->virtual_streams[i].total_visit_nums;
+				// TODO : physical stream id == index or index + 1, here is id == index
+				old_pstream_id = bs->virtual_streams[i].physical_stream_id;
+				new_pstream_id = old_pstream_id;
+				// calculate the ratio diff between the virtual stream and now physical stream 
+				// as min diff
+				min_diff = ratio > bs->physical_streams[old_pstream_id].ratio ? \
+					ratio - bs->physical_streams[old_pstream_id].ratio : \
+					bs->physical_streams[old_pstream_id].ratio - ratio;
+				// calculate all the ratio diff with all optional physical streams (except fixed 0,1,2)
+				// TODO : 0,1,2 physical stream is fixed
+				for(uint32_t j = 3; j < bs->num_physical_streams; j++) {
+					if(j != bs->virtual_streams[i].physical_stream_id) {
+						// calculate the ratio diff between the virtual stream and the physical stream 
+						diff = ratio > bs->physical_streams[j].ratio ? \
+							ratio - bs->physical_streams[j].ratio : \
+							bs->physical_streams[j].ratio - ratio;
+						if(diff < min_diff) {
+							min_diff = diff;
+							new_pstream_id = j;
+						}
+					}
+				}
+				if(new_pstream_id != old_pstream_id) {
+					// if the map relationship changed, update the old physical stream's info
+					pthread_spin_lock(&(bs->physical_streams[old_pstream_id].stream_lock));
+					bs->physical_streams[old_pstream_id].total_visit_nums -= bs->virtual_streams[i].total_visit_nums;
+					bs->physical_streams[old_pstream_id].total_evict_nums -= bs->virtual_streams[i].total_evict_nums;
+					pthread_spin_unlock(&(bs->physical_streams[old_pstream_id].stream_lock));
+					// if the map relationship changed, update the new physical stream's info
+					pthread_spin_lock(&(bs->physical_streams[new_pstream_id].stream_lock));
+					bs->physical_streams[new_pstream_id].total_visit_nums += bs->virtual_streams[i].total_visit_nums;
+					bs->physical_streams[new_pstream_id].total_evict_nums += bs->virtual_streams[i].total_evict_nums;
+					pthread_spin_unlock(&(bs->physical_streams[new_pstream_id].stream_lock));
+				}
+				pthread_mutex_unlock(&(bs->virtual_streams[i].stream_lock));
+			}
+		}
+	}
+	pthread_mutex_unlock(&bs->stream_upd_mtx);
+	
 }
 
 /* START spdk_bs_load */
@@ -3266,6 +3719,178 @@ struct spdk_bs_load_ctx {
 	spdk_bs_dump_print_xattr		print_xattr_fn;
 	char					xattr_name[4096];
 };
+
+// NOTE huhaosheng defined
+static int
+bs_alloc_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_store **_bs,
+	 struct spdk_bs_load_ctx **_ctx)
+{
+	struct spdk_blob_store	*bs;
+	struct spdk_bs_load_ctx	*ctx;
+	uint64_t dev_size;
+	int rc;
+
+	dev_size = dev->blocklen * dev->blockcnt;
+	if (dev_size < opts->cluster_sz) {
+		/* Device size cannot be smaller than cluster size of blobstore */
+		SPDK_INFOLOG(blob, "Device size %" PRIu64 " is smaller than cluster size %" PRIu32 "\n",
+			     dev_size, opts->cluster_sz);
+		return -ENOSPC;
+	}
+	if (opts->cluster_sz < SPDK_BS_PAGE_SIZE) {
+		/* Cluster size cannot be smaller than page size */
+		SPDK_ERRLOG("Cluster size %" PRIu32 " is smaller than page size %d\n",
+			    opts->cluster_sz, SPDK_BS_PAGE_SIZE);
+		return -EINVAL;
+	}
+	bs = calloc(1, sizeof(struct spdk_blob_store));
+	if (!bs) {
+		return -ENOMEM;
+	}
+
+	ctx = calloc(1, sizeof(struct spdk_bs_load_ctx));
+	if (!ctx) {
+		free(bs);
+		return -ENOMEM;
+	}
+
+	ctx->bs = bs;
+	ctx->iter_cb_fn = opts->iter_cb_fn;
+	ctx->iter_cb_arg = opts->iter_cb_arg;
+
+	ctx->super = spdk_zmalloc(sizeof(*ctx->super), 0x1000, NULL,
+				  SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (!ctx->super) {
+		free(ctx);
+		free(bs);
+		return -ENOMEM;
+	}
+
+	TAILQ_INIT(&bs->blobs);
+	TAILQ_INIT(&bs->snapshots);
+	bs->dev = dev;
+	bs->md_thread = spdk_get_thread();
+	assert(bs->md_thread != NULL);
+
+	/*
+	 * Do not use bs_lba_to_cluster() here since blockcnt may not be an
+	 *  even multiple of the cluster size.
+	 */
+	bs->cluster_sz = opts->cluster_sz;
+	bs->total_clusters = dev->blockcnt / (bs->cluster_sz / dev->blocklen);
+	ctx->used_clusters = spdk_bit_array_create(bs->total_clusters);
+	if (!ctx->used_clusters) {
+		spdk_free(ctx->super);
+		free(ctx);
+		free(bs);
+		return -ENOMEM;
+	}
+
+	bs->pages_per_cluster = bs->cluster_sz / SPDK_BS_PAGE_SIZE;
+	if (spdk_u32_is_pow2(bs->pages_per_cluster)) {
+		bs->pages_per_cluster_shift = spdk_u32log2(bs->pages_per_cluster);
+	}
+	bs->num_free_clusters = bs->total_clusters;
+	bs->io_unit_size = dev->blocklen;
+
+	bs->max_channel_ops = opts->max_channel_ops;
+	bs->super_blob = SPDK_BLOBID_INVALID;
+	memcpy(&bs->bstype, &opts->bstype, sizeof(opts->bstype));
+
+	/* NOTE huhaosheng add start */
+	bs->cluster_stats = calloc(bs->total_clusters, sizeof(struct spdk_cluster_stats));
+	for(uint64_t i = 0; i < bs->total_clusters; i++) {
+		bs->cluster_stats[i].pages = spdk_bit_array_create(bs->pages_per_cluster);
+		pthread_spin_init(&(bs->cluster_stats[i].pages_lock), NULL);
+	}
+	bs->num_virtual_streams = opts->num_virtual_streams;
+	bs->num_physical_streams = opts->num_physical_streams;
+	bs->virtual_streams = calloc(bs->num_virtual_streams, sizeof(struct spdk_virtual_stream_info));
+
+	// NOTE : init virtual stream and physical stream map relationship
+	// TODO : physical stream id == index or index+1, here is id == index
+	for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
+		pthread_spin_init(&(bs->virtual_streams[i].stream_lock), NULL);
+		// seq init map relationship 
+		bs->virtual_streams[i].physical_stream_id = i;
+	}
+	srand(time(NULL));
+	for(uint32_t i = bs->num_physical_streams; i < bs->num_virtual_streams; i++) {
+		pthread_spin_init(&(bs->virtual_streams[i].stream_lock), NULL);
+		// TODO : how many physical stream ids are fixed, here is 3
+		// random init the rest of map relationship
+		bs->virtual_streams[i].physical_stream_id = rand() % (bs->num_physical_streams - 3) + 3;
+	}
+
+	bs->physical_streams = calloc(bs->num_physical_streams, sizeof(struct spdk_physical_stream_info));
+	for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
+		pthread_spin_init(&(bs->physical_streams[i].stream_lock), NULL);
+	}
+
+	pthread_mutex_init(&bs->stream_upd_mtx, NULL);
+	pthread_cond_init(&bs->stream_upd_cond, NULL);
+	pthread_create(&(bs->stream_upd_thread_id), NULL, &bs_stream_update_fn, (void*)bs);
+	bs->stream_upd_tid_set = true;
+	/* NOTE huhaosheng add end */
+
+	/* The metadata is assumed to be at least 1 page */
+	bs->used_md_pages = spdk_bit_array_create(1);
+	bs->used_blobids = spdk_bit_array_create(0);
+	bs->open_blobids = spdk_bit_array_create(0);
+
+	pthread_mutex_init(&bs->used_clusters_mutex, NULL);
+
+	spdk_io_device_register(bs, bs_channel_create, bs_channel_destroy,
+				sizeof(struct spdk_bs_channel), "blobstore");
+	rc = bs_register_md_thread(bs);
+	if (rc == -1) {
+		spdk_io_device_unregister(bs, NULL);
+		pthread_mutex_destroy(&bs->used_clusters_mutex);
+		spdk_bit_array_free(&bs->open_blobids);
+		spdk_bit_array_free(&bs->used_blobids);
+		spdk_bit_array_free(&bs->used_md_pages);
+		spdk_bit_array_free(&ctx->used_clusters);
+		/* NOTE huhaosheng add start */
+		// close pthread first
+ 		if(bs->stream_upd_tid_set) {
+			pthread_mutex_lock(&bs->stream_upd_mtx);
+			bs->stream_upd_loop = false;
+			pthread_cond_signal(&bs->stream_upd_cond);
+			pthread_mutex_unlock(&bs->stream_upd_mtx);
+			pthread_join(bs->stream_upd_thread_id, NULL);
+
+			pthread_mutex_destroy(&bs->stream_upd_mtx);
+			pthread_cond_destroy(&bs->stream_upd_cond);
+			bs->stream_upd_tid_set = false;
+		}
+		// free cluster stats
+		for(uint64_t i = 0; i < bs->total_clusters; i++) {
+			spdk_bit_array_free(&(bs->cluster_stats[i].pages));
+			pthread_spin_destroy(&(bs->cluster_stats[i].pages_lock));
+		}
+		free(bs->cluster_stats);
+		// free virtual streams info
+		for(uint32_t i = 0; i < bs->num_virtual_streams; i++) {
+			pthread_spin_destroy(&(bs->virtual_streams[i].stream_lock));
+		}
+		free(bs->virtual_streams);
+		// free physical streams info
+		for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
+			pthread_spin_destroy(&(bs->physical_streams[i].stream_lock));
+		}
+		free(bs->physical_streams);
+		/* NOTE huhaosheng add end */
+		spdk_free(ctx->super);
+		free(ctx);
+		free(bs);
+		/* FIXME: this is a lie but don't know how to get a proper error code here */
+		return -ENOMEM;
+	}
+
+	*_ctx = ctx;
+	*_bs = bs;
+	return 0;
+}
 
 static int
 bs_alloc(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob_store **_bs,
@@ -4393,6 +5018,67 @@ bs_opts_copy(struct spdk_bs_opts *src, struct spdk_bs_opts *dst)
 	return 0;
 }
 
+// NOTE huhaosheng defined
+void
+spdk_bs_load_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
+	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob_store	*bs;
+	struct spdk_bs_cpl	cpl;
+	struct spdk_bs_load_ctx *ctx;
+	struct spdk_bs_opts	opts = {};
+	int err;
+
+	SPDK_DEBUGLOG(blob, "Loading blobstore from dev %p\n", dev);
+
+	if ((SPDK_BS_PAGE_SIZE % dev->blocklen) != 0) {
+		SPDK_DEBUGLOG(blob, "unsupported dev block length of %d\n", dev->blocklen);
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	spdk_bs_opts_init(&opts, sizeof(opts));
+	if (o) {
+		if (bs_opts_copy(o, &opts)) {
+			return;
+		}
+	}
+
+	if (opts.max_md_ops == 0 || opts.max_channel_ops == 0) {
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	// NOTE huhaosheng changed
+	err = bs_alloc_ms(dev, &opts, &bs, &ctx);
+	if (err) {
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, err);
+		return;
+	}
+
+	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;
+	cpl.u.bs_handle.cb_fn = cb_fn;
+	cpl.u.bs_handle.cb_arg = cb_arg;
+	cpl.u.bs_handle.bs = bs;
+
+	ctx->seq = bs_sequence_start(bs->md_channel, &cpl);
+	if (!ctx->seq) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	/* Read the super block */
+	bs_sequence_read_dev(ctx->seq, ctx->super, bs_page_to_lba(bs, 0),
+			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
+			     bs_load_super_cpl, ctx);
+}
+
 void
 spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
 	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
@@ -4659,6 +5345,52 @@ bs_dump_super_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs_dump_read_md_page(seq, ctx);
 }
 
+// NOTE huhaosheng defined
+void
+spdk_bs_dump_ms(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_xattr_fn,
+	     spdk_bs_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_blob_store	*bs;
+	struct spdk_bs_cpl	cpl;
+	spdk_bs_sequence_t	*seq;
+	struct spdk_bs_load_ctx *ctx;
+	struct spdk_bs_opts	opts = {};
+	int err;
+
+	SPDK_DEBUGLOG(blob, "Dumping blobstore from dev %p\n", dev);
+
+	spdk_bs_opts_init(&opts, sizeof(opts));
+	
+	// NOTE huhaosheng changed
+	err = bs_alloc_ms(dev, &opts, &bs, &ctx);
+	if (err) {
+		dev->destroy(dev);
+		cb_fn(cb_arg, err);
+		return;
+	}
+
+	ctx->fp = fp;
+	ctx->print_xattr_fn = print_xattr_fn;
+
+	cpl.type = SPDK_BS_CPL_TYPE_BS_BASIC;
+	cpl.u.bs_basic.cb_fn = cb_fn;
+	cpl.u.bs_basic.cb_arg = cb_arg;
+
+	seq = bs_sequence_start(bs->md_channel, &cpl);
+	if (!seq) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	/* Read the super block */
+	bs_sequence_read_dev(seq, ctx->super, bs_page_to_lba(bs, 0),
+			     bs_byte_to_lba(bs, sizeof(*ctx->super)),
+			     bs_dump_super_cpl, ctx);
+}
+
 void
 spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_xattr_fn,
 	     spdk_bs_op_complete cb_fn, void *cb_arg)
@@ -4728,6 +5460,209 @@ bs_init_trim_cpl(spdk_bs_sequence_t *seq, void *cb_arg, int bserrno)
 	bs_sequence_write_dev(seq, ctx->super, bs_page_to_lba(ctx->bs, 0),
 			      bs_byte_to_lba(ctx->bs, sizeof(*ctx->super)),
 			      bs_init_persist_super_cpl, ctx);
+}
+
+// NOTE huhaosheng defined
+void
+spdk_bs_init_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *o,
+	     spdk_bs_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_bs_load_ctx *ctx;
+	struct spdk_blob_store	*bs;
+	struct spdk_bs_cpl	cpl;
+	spdk_bs_sequence_t	*seq;
+	spdk_bs_batch_t		*batch;
+	uint64_t		num_md_lba;
+	uint64_t		num_md_pages;
+	uint64_t		num_md_clusters;
+	uint32_t		i;
+	struct spdk_bs_opts	opts = {};
+	int			rc;
+	uint64_t		lba, lba_count;
+
+	SPDK_DEBUGLOG(blob, "Initializing blobstore on dev %p\n", dev);
+
+	if ((SPDK_BS_PAGE_SIZE % dev->blocklen) != 0) {
+		SPDK_ERRLOG("unsupported dev block length of %d\n",
+			    dev->blocklen);
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	spdk_bs_opts_init(&opts, sizeof(opts));
+	if (o) {
+		if (bs_opts_copy(o, &opts)) {
+			return;
+		}
+	}
+
+	if (bs_opts_verify(&opts) != 0) {
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, -EINVAL);
+		return;
+	}
+
+	// NOTE huhaosheng changed
+	rc = bs_alloc_ms(dev, &opts, &bs, &ctx);
+	if (rc) {
+		dev->destroy(dev);
+		cb_fn(cb_arg, NULL, rc);
+		return;
+	}
+
+	if (opts.num_md_pages == SPDK_BLOB_OPTS_NUM_MD_PAGES) {
+		/* By default, allocate 1 page per cluster.
+		 * Technically, this over-allocates metadata
+		 * because more metadata will reduce the number
+		 * of usable clusters. This can be addressed with
+		 * more complex math in the future.
+		 */
+		bs->md_len = bs->total_clusters;
+	} else {
+		bs->md_len = opts.num_md_pages;
+	}
+	rc = spdk_bit_array_resize(&bs->used_md_pages, bs->md_len);
+	if (rc < 0) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	rc = spdk_bit_array_resize(&bs->used_blobids, bs->md_len);
+	if (rc < 0) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	rc = spdk_bit_array_resize(&bs->open_blobids, bs->md_len);
+	if (rc < 0) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	memcpy(ctx->super->signature, SPDK_BS_SUPER_BLOCK_SIG,
+	       sizeof(ctx->super->signature));
+	ctx->super->version = SPDK_BS_VERSION;
+	ctx->super->length = sizeof(*ctx->super);
+	ctx->super->super_blob = bs->super_blob;
+	ctx->super->clean = 0;
+	ctx->super->cluster_size = bs->cluster_sz;
+	ctx->super->io_unit_size = bs->io_unit_size;
+	memcpy(&ctx->super->bstype, &bs->bstype, sizeof(bs->bstype));
+
+	/* Calculate how many pages the metadata consumes at the front
+	 * of the disk.
+	 */
+
+	/* The super block uses 1 page */
+	num_md_pages = 1;
+
+	/* The used_md_pages mask requires 1 bit per metadata page, rounded
+	 * up to the nearest page, plus a header.
+	 */
+	ctx->super->used_page_mask_start = num_md_pages;
+	ctx->super->used_page_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					 spdk_divide_round_up(bs->md_len, 8),
+					 SPDK_BS_PAGE_SIZE);
+	num_md_pages += ctx->super->used_page_mask_len;
+
+	/* The used_clusters mask requires 1 bit per cluster, rounded
+	 * up to the nearest page, plus a header.
+	 */
+	ctx->super->used_cluster_mask_start = num_md_pages;
+	ctx->super->used_cluster_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					    spdk_divide_round_up(bs->total_clusters, 8),
+					    SPDK_BS_PAGE_SIZE);
+	num_md_pages += ctx->super->used_cluster_mask_len;
+
+	/* The used_blobids mask requires 1 bit per metadata page, rounded
+	 * up to the nearest page, plus a header.
+	 */
+	ctx->super->used_blobid_mask_start = num_md_pages;
+	ctx->super->used_blobid_mask_len = spdk_divide_round_up(sizeof(struct spdk_bs_md_mask) +
+					   spdk_divide_round_up(bs->md_len, 8),
+					   SPDK_BS_PAGE_SIZE);
+	num_md_pages += ctx->super->used_blobid_mask_len;
+
+	/* The metadata region size was chosen above */
+	ctx->super->md_start = bs->md_start = num_md_pages;
+	ctx->super->md_len = bs->md_len;
+	num_md_pages += bs->md_len;
+
+	num_md_lba = bs_page_to_lba(bs, num_md_pages);
+
+	ctx->super->size = dev->blockcnt * dev->blocklen;
+
+	ctx->super->crc = blob_md_page_calc_crc(ctx->super);
+
+	num_md_clusters = spdk_divide_round_up(num_md_pages, bs->pages_per_cluster);
+	if (num_md_clusters > bs->total_clusters) {
+		SPDK_ERRLOG("Blobstore metadata cannot use more clusters than is available, "
+			    "please decrease number of pages reserved for metadata "
+			    "or increase cluster size.\n");
+		spdk_free(ctx->super);
+		spdk_bit_array_free(&ctx->used_clusters);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+	/* Claim all of the clusters used by the metadata */
+	for (i = 0; i < num_md_clusters; i++) {
+		spdk_bit_array_set(ctx->used_clusters, i);
+	}
+
+	bs->num_free_clusters -= num_md_clusters;
+	bs->total_data_clusters = bs->num_free_clusters;
+
+	cpl.type = SPDK_BS_CPL_TYPE_BS_HANDLE;
+	cpl.u.bs_handle.cb_fn = cb_fn;
+	cpl.u.bs_handle.cb_arg = cb_arg;
+	cpl.u.bs_handle.bs = bs;
+
+	seq = bs_sequence_start(bs->md_channel, &cpl);
+	if (!seq) {
+		spdk_free(ctx->super);
+		free(ctx);
+		bs_free(bs);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	batch = bs_sequence_to_batch(seq, bs_init_trim_cpl, ctx);
+
+	/* Clear metadata space */
+	bs_batch_write_zeroes_dev(batch, 0, num_md_lba);
+
+	lba = num_md_lba;
+	while (lba < ctx->bs->dev->blockcnt) {
+		lba_count = spdk_min(UINT32_MAX, ctx->bs->dev->blockcnt - lba);
+		switch (opts.clear_method) {
+		case BS_CLEAR_WITH_UNMAP:
+			/* Trim data clusters */
+			bs_batch_unmap_dev(batch, lba, lba_count);
+			break;
+		case BS_CLEAR_WITH_WRITE_ZEROES:
+			/* Write_zeroes to data clusters */
+			bs_batch_write_zeroes_dev(batch, lba, lba_count);
+			break;
+		case BS_CLEAR_WITH_NONE:
+		default:
+			break;
+		}
+		lba += lba_count;
+	}
+
+	bs_batch_close(batch);
 }
 
 void
@@ -7225,6 +8160,16 @@ void spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *c
 {
 	blob_request_submit_op(blob, channel, NULL, offset, length, cb_fn, cb_arg,
 			       SPDK_BLOB_WRITE_ZEROES);
+}
+
+// NOTE huhaosheng defined
+void spdk_blob_io_write_ms(struct spdk_blob *blob, struct spdk_io_channel *channel,
+			void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+			spdk_blob_op_complete cb_fn, void *cb_arg)
+{
+	// NOTE huhaosheng changed
+	blob_request_submit_op_ms(blob, channel, payload, offset, length, vstream_id, cb_fn, cb_arg,
+			       SPDK_BLOB_WRITE);
 }
 
 void spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,

@@ -4,8 +4,11 @@
 	# Public functions
 	spdk_bs_opts_init;
 	spdk_bs_load;
+	spdk_bs_load_ms;
 	spdk_bs_init;
+	spdk_bs_init_ms;
 	spdk_bs_dump;
+	spdk_bs_dump_ms;
 	spdk_bs_destroy;
 	spdk_bs_unload;
 	spdk_bs_set_super;
@@ -43,6 +46,7 @@
 	spdk_bs_alloc_io_channel;
 	spdk_bs_free_io_channel;
 	spdk_blob_io_write;
+	spdk_blob_io_write_ms;
 	spdk_blob_io_read;
 	spdk_blob_io_writev;
 	spdk_blob_io_readv;

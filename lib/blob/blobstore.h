@@ -52,6 +52,11 @@
 #define SPDK_BLOB_OPTS_DEFAULT_CHANNEL_OPS 512
 #define SPDK_BLOB_BLOBID_HIGH_BIT (1ULL << 32)
 
+/** NOTE huhaosheng declared */
+#define SPDK_NUM_VIRTUAL_STREAMS 16      // num of virtual streams
+#define SPDK_NUM_PHYSICAL_STREAMS 8      // num of physical streams
+#define SPDK_STREAM_UPDATE_TIMEOUT 60ul  // stream states update timeout seconds
+
 struct spdk_xattr {
 	uint32_t	index;
 	uint16_t	value_len;
@@ -174,6 +179,35 @@ struct spdk_blob {
 	uint64_t	remaining_clusters_in_et;
 };
 
+// NOTE: huhaosheng declared
+// TODO: confirm stream id from 0->end or 1->end
+struct spdk_virtual_stream_info
+{
+	uint32_t physical_stream_id;
+	uint64_t total_visit_nums;
+	uint64_t total_evict_nums;
+	pthread_spinlock_t	 stream_lock; // NOTE : pthread_mutex_t change to pthread_spinlock_t
+};
+struct spdk_physical_stream_info
+{
+	uint64_t total_visit_nums;
+	uint64_t total_evict_nums;
+	double ratio;
+	pthread_spinlock_t	 stream_lock;
+};
+
+// NOTE: huhaosheng declared
+struct spdk_cluster_stats {
+	uint64_t visit_nums;
+	uint64_t evict_nums;
+	pthread_spinlock_t	 pages_lock;
+	/* if pages per cluster == n , bitmap bits = n/8 */
+	/* page id = x, pages per cluster = n: (bits[x % n / 8] >> (x % n) % 8) & 0x01 */
+	// char bits[]; 
+	/* page id = x, pages per cluster = n: spdk_bit_array_get(pages, x % n) */
+	struct spdk_bit_array	*pages;
+};
+
 struct spdk_blob_store {
 	uint64_t			md_start; /* Offset from beginning of disk, in pages */
 	uint32_t			md_len; /* Count, in pages */
@@ -210,6 +244,19 @@ struct spdk_blob_store {
 	TAILQ_HEAD(, spdk_blob_list)	snapshots;
 
 	bool                            clean;
+
+	/* NOTE: for multi stream */
+	struct spdk_cluster_stats      *cluster_stats;
+	uint32_t 						num_virtual_streams;
+	uint32_t 						num_physical_streams;
+	struct spdk_virtual_stream_info        *virtual_streams;
+	struct spdk_physical_stream_info 	   *physical_streams;
+
+	bool stream_upd_tid_set;
+	bool stream_upd_loop;
+	pthread_t stream_upd_thread_id;
+	pthread_mutex_t stream_upd_mtx;
+	pthread_cond_t stream_upd_cond;
 };
 
 struct spdk_bs_channel {
@@ -698,5 +745,27 @@ bs_io_unit_is_allocated(struct spdk_blob *blob, uint64_t io_unit)
 		return true;
 	}
 }
+
+// NOTE huhaosheng 
+/**
+ * update cluster stats and virtual/physical stream stats
+ *
+ * \param stream_id the virtual stream id
+ *
+ * \return   the physical stream id
+ */
+static inline uint32_t 
+blob_get_pstream_id(struct spdk_blob *blob, uint32_t vstream_id) {
+	uint32_t pstream_id;
+	// TODO : failure
+	assert(vstream_id < blob->bs->num_virtual_streams);
+
+	pthread_spin_lock(&(blob->bs->virtual_streams[vstream_id].stream_lock));
+	pstream_id = blob->bs->virtual_streams[vstream_id].physical_stream_id;
+	pthread_spin_unlock(&(blob->bs->virtual_streams[vstream_id].stream_lock));
+
+	return pstream_id;
+}
+
 
 #endif

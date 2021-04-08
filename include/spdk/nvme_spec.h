@@ -982,6 +982,13 @@ SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw10) == 4, "Incorrect size");
 union spdk_nvme_cmd_cdw11 {
 	uint32_t raw;
 
+	// NOTE denghejian: add Directive Command
+	struct {
+		uint32_t doper    : 8;
+		uint32_t dtype    : 8;
+		uint32_t dspec    : 16;
+	} directive;
+
 	struct {
 		/* NVM Set Identifier */
 		uint32_t nvmsetid  : 16;
@@ -1060,6 +1067,42 @@ union spdk_nvme_cmd_cdw11 {
 };
 SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw11) == 4, "Incorrect size");
 
+union spdk_nvme_cmd_cdw12 {
+	uint32_t raw;
+
+	// NOTE denghejian: add for enabling directive
+	struct {
+		uint32_t endir    : 1;
+		uint32_t rsv1     : 7;
+		uint32_t dtype    : 8;
+		uint32_t rsv2    : 8;
+	} enable_directive;
+
+	// NOTE denghejian: add for write command
+	struct {
+		uint32_t nlb      : 16;
+		uint32_t rsv1     : 4;
+		uint32_t dtype    : 4;
+		uint32_t rsv2     : 2;
+		uint32_t prinfo   : 4;
+		uint32_t fua      : 1;
+		uint32_t lr       : 1;
+	} wirte;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw12) == 4, "Incorrect size");
+
+union spdk_nvme_cmd_cdw13 {
+	uint32_t raw;
+
+	// NOTE denghejian: add for multi-stream write
+	struct {
+		uint32_t dsm      : 8;
+		uint32_t rsv1     : 8;
+		uint32_t dspec    : 16;
+	} wirte;
+};
+SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw13) == 4, "Incorrect size");
+
 struct spdk_nvme_cmd {
 	/* dword 0 */
 	uint16_t opc	:  8;	/* opcode */
@@ -1099,8 +1142,16 @@ struct spdk_nvme_cmd {
 		union spdk_nvme_cmd_cdw11 cdw11_bits;
 	};
 	/* dword 12-15 */
-	uint32_t cdw12;		/* command-specific */
-	uint32_t cdw13;		/* command-specific */
+	// uint32_t cdw12;		/* command-specific */
+	union {
+		uint32_t cdw12;
+		union spdk_nvme_cmd_cdw12 cdw12_bits;
+	};
+	// uint32_t cdw13;		/* command-specific */
+	union {
+		uint32_t cdw13;
+		union spdk_nvme_cmd_cdw13 cdw13_bits;
+	};
 	uint32_t cdw14;		/* command-specific */
 	uint32_t cdw15;		/* command-specific */
 };

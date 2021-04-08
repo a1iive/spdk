@@ -170,6 +170,11 @@ struct spdk_bs_dev {
 		      uint64_t lba, uint32_t lba_count,
 		      struct spdk_bs_dev_cb_args *cb_args);
 
+	// NOTE denghejian declare write_ms
+	void (*write_ms)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel, void *payload,
+		      uint64_t lba, uint32_t lba_count, uint32_t pstream_id,
+		      struct spdk_bs_dev_cb_args *cb_args);
+
 	void (*readv)(struct spdk_bs_dev *dev, struct spdk_io_channel *channel,
 		      struct iovec *iov, int iovcnt,
 		      uint64_t lba, uint32_t lba_count,
@@ -214,6 +219,12 @@ struct spdk_bs_opts {
 	/** Maximum simultaneous operations per channel */
 	uint32_t max_channel_ops;
 
+	/** NOTE  huhaosheng declared. The size of virtual stream */
+	uint32_t num_virtual_streams;
+
+	/** NOTE  huhaosheng declared. The size of virtual stream */
+	uint32_t num_physical_streams;
+
 	/** Clear method */
 	enum bs_clear_method  clear_method;
 
@@ -254,6 +265,10 @@ void spdk_bs_opts_init(struct spdk_bs_opts *opts, size_t opts_size);
 void spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
 		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
 
+// NOTE huhaosheng declared
+void spdk_bs_load_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
+		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
+
 /**
  * Initialize a blobstore on the given device.
  *
@@ -263,6 +278,10 @@ void spdk_bs_load(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
  * \param cb_arg Argument passed to function cb_fn.
  */
 void spdk_bs_init(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
+		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
+
+// NOTE huhaosheng declared
+void spdk_bs_init_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts,
 		  spdk_bs_op_with_handle_complete cb_fn, void *cb_arg);
 
 typedef void (*spdk_bs_dump_print_xattr)(FILE *fp, const char *bstype, const char *name,
@@ -279,6 +298,11 @@ typedef void (*spdk_bs_dump_print_xattr)(FILE *fp, const char *bstype, const cha
  */
 void spdk_bs_dump(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_xattr_fn,
 		  spdk_bs_op_complete cb_fn, void *cb_arg);
+
+// NOTE huhaosheng declared
+void spdk_bs_dump_ms(struct spdk_bs_dev *dev, FILE *fp, spdk_bs_dump_print_xattr print_xattr_fn,
+		  spdk_bs_op_complete cb_fn, void *cb_arg);
+
 /**
  * Destroy the blobstore.
  *
@@ -727,6 +751,11 @@ void spdk_bs_free_io_channel(struct spdk_io_channel *channel);
  */
 void spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
 			void *payload, uint64_t offset, uint64_t length,
+			spdk_blob_op_complete cb_fn, void *cb_arg);
+
+// NOTE denghejian declare spdk_blob_io_write_ms
+void spdk_blob_io_write_ms(struct spdk_blob *blob, struct spdk_io_channel *channel,
+			void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
 			spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**
