@@ -207,6 +207,12 @@ struct spdk_bs_type {
 };
 
 struct spdk_bs_opts {
+	/** NOTE  huhaosheng declared. The size of virtual stream */
+	uint32_t num_virtual_streams;
+
+	/** NOTE  huhaosheng declared. The size of virtual stream */
+	uint32_t num_physical_streams;
+
 	/** Size of cluster in bytes. Must be multiple of 4KiB page size. */
 	uint32_t cluster_sz;
 
@@ -218,13 +224,7 @@ struct spdk_bs_opts {
 
 	/** Maximum simultaneous operations per channel */
 	uint32_t max_channel_ops;
-
-	/** NOTE  huhaosheng declared. The size of virtual stream */
-	uint32_t num_virtual_streams;
-
-	/** NOTE  huhaosheng declared. The size of virtual stream */
-	uint32_t num_physical_streams;
-
+	
 	/** Clear method */
 	enum bs_clear_method  clear_method;
 

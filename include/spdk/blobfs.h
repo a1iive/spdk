@@ -248,6 +248,9 @@ int spdk_fs_create_file(struct spdk_filesystem *fs, struct spdk_fs_thread_ctx *c
 int spdk_fs_open_file(struct spdk_filesystem *fs, struct spdk_fs_thread_ctx *ctx,
 		      const char *name, uint32_t flags, struct spdk_file **file);
 
+// NOTE huhaosheng defined
+int spdk_fs_open_file_ms(struct spdk_filesystem *fs, struct spdk_fs_thread_ctx *ctx,
+		      const char *name, uint32_t flags, struct spdk_file **file, uint8_t file_type);
 /**
  * Close the file.
  *
@@ -351,7 +354,7 @@ int spdk_file_write(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		    void *payload, uint64_t offset, uint64_t length);
 
 // NOTE huhaosheng declared
-int spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx, uint32_t vstream_id,
+int spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		    void *payload, uint64_t offset, uint64_t length);
 
 /**
@@ -480,6 +483,9 @@ void spdk_fs_file_stat_async(struct spdk_filesystem *fs, const char *name,
 void spdk_fs_create_file_async(struct spdk_filesystem *fs, const char *name,
 			       spdk_file_op_complete cb_fn, void *cb_arg);
 
+// NOTE huhaosheng defined
+void spdk_fs_create_file_async_ms(struct spdk_filesystem *fs, const char *name, uint8_t file_type,
+			       spdk_file_op_complete cb_fn, void *cb_arg);
 /**
  * Open the file.
  *
@@ -492,6 +498,10 @@ void spdk_fs_create_file_async(struct spdk_filesystem *fs, const char *name,
  * return None.
  */
 void spdk_fs_open_file_async(struct spdk_filesystem *fs, const char *name, uint32_t flags,
+			     spdk_file_op_with_handle_complete cb_fn, void *cb_arg);
+
+// NOTE huhaosheng defined
+void spdk_fs_open_file_async_ms(struct spdk_filesystem *fs, const char *name, uint32_t flags, uint8_t file_type,
 			     spdk_file_op_with_handle_complete cb_fn, void *cb_arg);
 
 /**

@@ -1,5 +1,5 @@
-// #include "core/env.h" // for YCSB-C
-#include "mongo/db/storage/wiredtiger/wiredtiger_env.h"  // for mongodb
+#include "core/env.h" // for YCSB-C
+// #include "mongo/db/storage/wiredtiger/wiredtiger_env.h"  // for mongodb
 
 extern "C" {
     #include "spdk/env.h"
@@ -14,8 +14,8 @@ extern "C" {
     #include "spdk_internal/thread.h"
 }
 
-// namespace ycsbc // for YCSB-C
-namespace mongo // for mongodb
+namespace ycsbc // for YCSB-C
+// namespace mongo // for mongodb
 {
 
 struct spdk_filesystem *g_wt_fs = NULL;
@@ -312,28 +312,48 @@ int spdk_fs_directory_list_free(char **dirlist, uint32_t count)
     return (0);
 }
 
-int spdk_open_file(struct spdk_file_fd **fd, const char *name,
-  int file_type)
+int spdk_open_file(struct spdk_file_fd **fd, const char *name/*, int file_type*/)
 {
     // char *path;
     struct spdk_file *file;
     int rc;
+    uint8_t file_type;
 
     // path = NULL;
     *fd = (struct spdk_file_fd *)calloc(1, sizeof(**fd));
     // TODO : 是否所有name传参都可能是文件名，还是都是绝对路径
     // WT_RET(__wt_filename(session, name, &path));
+    const char *fname = basename(name);
+
+    if(strncmp(fname, "index", 5) == 0) {
+        // index file
+        file_type = 3;
+    } else if(strncmp(fname, "collection", 10) == 0) {
+        // data file
+        file_type = 2;
+    } else if(strncmp(fname, "WiredTigerLog", 13) == 0 || strncmp(fname, "WiredTigerPreplog", 17) == 0) {
+        // log file
+        file_type = 1;
+    } else {
+        // metadata file
+        file_type = 0;
+    }
+
     set_channel();
+    /*
     if (file_type == 0){
-        rc = spdk_fs_open_file(g_wt_fs, g_wt_sync_args.channel,
-                        name, 0, &file);
+        rc = spdk_fs_open_file_ms(g_wt_fs, g_wt_sync_args.channel,
+                        name, 0, &file, file_type);
     }
     else {
-        rc = spdk_fs_open_file(g_wt_fs, g_wt_sync_args.channel,
-                        name, SPDK_BLOBFS_OPEN_CREATE, &file);
+        rc = spdk_fs_open_file_ms(g_wt_fs, g_wt_sync_args.channel,
+                        name, SPDK_BLOBFS_OPEN_CREATE, &file, file_type);
     }
+    */
+    rc = spdk_fs_open_file_ms(g_wt_fs, g_wt_sync_args.channel,
+                        name, SPDK_BLOBFS_OPEN_CREATE, &file, file_type);
+
     if(rc == 0) {
-        // TODO : file need save in someplace
         (*fd)->mFile = file;
         return 0;
     } else {

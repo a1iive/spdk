@@ -2495,6 +2495,59 @@ struct op_split_ctx {
 	uint32_t vstream_id;
 };
 
+static void
+blob_request_submit_op_split_next(void *cb_arg, int bserrno)
+{
+	struct op_split_ctx	*ctx = cb_arg;
+	struct spdk_blob	*blob = ctx->blob;
+	struct spdk_io_channel	*ch = ctx->channel;
+	enum spdk_blob_op_type	op_type = ctx->op_type;
+	uint8_t			*buf = ctx->curr_payload;
+	uint64_t		offset = ctx->io_unit_offset;
+	uint64_t		length = ctx->io_units_remaining;
+	uint64_t		op_length;
+
+	if (bserrno != 0 || ctx->io_units_remaining == 0) {
+		bs_sequence_finish(ctx->seq, bserrno);
+		free(ctx);
+		return;
+	}
+
+	op_length = spdk_min(length, bs_num_io_units_to_cluster_boundary(blob,
+			     offset));
+
+	/* Update length and payload for next operation */
+	ctx->io_units_remaining -= op_length;
+	ctx->io_unit_offset += op_length;
+	if (op_type == SPDK_BLOB_WRITE || op_type == SPDK_BLOB_READ) {
+		ctx->curr_payload += op_length * blob->bs->io_unit_size;
+	}
+
+	switch (op_type) {
+	case SPDK_BLOB_READ:
+		spdk_blob_io_read(blob, ch, buf, offset, op_length,
+				  blob_request_submit_op_split_next, ctx);
+		break;
+	case SPDK_BLOB_WRITE:
+		spdk_blob_io_write(blob, ch, buf, offset, op_length,
+				   blob_request_submit_op_split_next, ctx);
+		break;
+	case SPDK_BLOB_UNMAP:
+		spdk_blob_io_unmap(blob, ch, offset, op_length,
+				   blob_request_submit_op_split_next, ctx);
+		break;
+	case SPDK_BLOB_WRITE_ZEROES:
+		spdk_blob_io_write_zeroes(blob, ch, offset, op_length,
+					  blob_request_submit_op_split_next, ctx);
+		break;
+	case SPDK_BLOB_READV:
+	case SPDK_BLOB_WRITEV:
+		SPDK_ERRLOG("readv/write not valid\n");
+		bs_sequence_finish(ctx->seq, -EINVAL);
+		free(ctx);
+		break;
+	}
+}
 // NOTE huhaosheng define
 static void
 blob_request_submit_op_split_next_ms(void *cb_arg, int bserrno)
@@ -2532,60 +2585,6 @@ blob_request_submit_op_split_next_ms(void *cb_arg, int bserrno)
 	case SPDK_BLOB_WRITE:
 		spdk_blob_io_write_ms(blob, ch, buf, offset, op_length, ctx->vstream_id,
 				   blob_request_submit_op_split_next_ms, ctx);
-		break;
-	case SPDK_BLOB_UNMAP:
-		spdk_blob_io_unmap(blob, ch, offset, op_length,
-				   blob_request_submit_op_split_next, ctx);
-		break;
-	case SPDK_BLOB_WRITE_ZEROES:
-		spdk_blob_io_write_zeroes(blob, ch, offset, op_length,
-					  blob_request_submit_op_split_next, ctx);
-		break;
-	case SPDK_BLOB_READV:
-	case SPDK_BLOB_WRITEV:
-		SPDK_ERRLOG("readv/write not valid\n");
-		bs_sequence_finish(ctx->seq, -EINVAL);
-		free(ctx);
-		break;
-	}
-}
-
-static void
-blob_request_submit_op_split_next(void *cb_arg, int bserrno)
-{
-	struct op_split_ctx	*ctx = cb_arg;
-	struct spdk_blob	*blob = ctx->blob;
-	struct spdk_io_channel	*ch = ctx->channel;
-	enum spdk_blob_op_type	op_type = ctx->op_type;
-	uint8_t			*buf = ctx->curr_payload;
-	uint64_t		offset = ctx->io_unit_offset;
-	uint64_t		length = ctx->io_units_remaining;
-	uint64_t		op_length;
-
-	if (bserrno != 0 || ctx->io_units_remaining == 0) {
-		bs_sequence_finish(ctx->seq, bserrno);
-		free(ctx);
-		return;
-	}
-
-	op_length = spdk_min(length, bs_num_io_units_to_cluster_boundary(blob,
-			     offset));
-
-	/* Update length and payload for next operation */
-	ctx->io_units_remaining -= op_length;
-	ctx->io_unit_offset += op_length;
-	if (op_type == SPDK_BLOB_WRITE || op_type == SPDK_BLOB_READ) {
-		ctx->curr_payload += op_length * blob->bs->io_unit_size;
-	}
-
-	switch (op_type) {
-	case SPDK_BLOB_READ:
-		spdk_blob_io_read(blob, ch, buf, offset, op_length,
-				  blob_request_submit_op_split_next, ctx);
-		break;
-	case SPDK_BLOB_WRITE:
-		spdk_blob_io_write(blob, ch, buf, offset, op_length,
-				   blob_request_submit_op_split_next, ctx);
 		break;
 	case SPDK_BLOB_UNMAP:
 		spdk_blob_io_unmap(blob, ch, offset, op_length,
@@ -2728,7 +2727,7 @@ blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_cou
 	assert(page < blob->bs->total_clusters * pages_per_cluster);
 	page_end = page % pages_per_cluster;
 
-	pthread_spin_lock(&(cluster_stats[cluster_index].pages_lock));
+	pthread_spin_lock(&(cluster_stats[cluster_index].lock));
 	uint64_t visit_add_nums = 0, evict_add_nums = 0;
 	for(uint32_t i = page_start; i <= page_end; i++) {
 		cluster_stats[cluster_index].visit_nums++;
@@ -2741,20 +2740,20 @@ blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_cou
 		}
 	}
 	// NOTE: virtual stream mutex first , then physical stream mutex
-	pthread_spin_lock(&(blob->bs->virtual_streams[vstream_id].stream_lock));
+	pthread_spin_lock(&(blob->bs->virtual_streams[vstream_id].lock));
 	blob->bs->virtual_streams[vstream_id].total_visit_nums += visit_add_nums;
 	blob->bs->virtual_streams[vstream_id].total_evict_nums += evict_add_nums;
 
 	// TODO : physical stream id == index or index+1
 	uint64_t pstream_id = blob->bs->virtual_streams[vstream_id].physical_stream_id;
-	pthread_spin_lock(&(blob->bs->physical_streams[pstream_id].stream_lock));
+	pthread_spin_lock(&(blob->bs->physical_streams[pstream_id].lock));
 	blob->bs->physical_streams[pstream_id].total_visit_nums += visit_add_nums;
 	blob->bs->physical_streams[pstream_id].total_evict_nums += evict_add_nums;
-	pthread_spin_unlock(&(blob->bs->physical_streams[pstream_id].stream_lock));
+	pthread_spin_unlock(&(blob->bs->physical_streams[pstream_id].lock));
 
-	pthread_spin_unlock(&(blob->bs->virtual_streams[vstream_id].stream_lock));
+	pthread_spin_unlock(&(blob->bs->virtual_streams[vstream_id].lock));
 
-	pthread_spin_unlock(&(cluster_stats[cluster_index].pages_lock));
+	pthread_spin_unlock(&(cluster_stats[cluster_index].lock));
 }
 
 // NOTE denghejian define blob_request_submit_op_single_ms
@@ -3385,7 +3384,7 @@ bs_dev_destroy(void *io_device)
 	struct spdk_blob_store *bs = io_device;
 	struct spdk_blob	*blob, *blob_tmp;
 
-	// NOTE: huhaosheng
+	/** NOTE: huhaosheng start */
 	// close pthread first
 	if(bs->stream_upd_tid_set) {
 		pthread_mutex_lock(&bs->stream_upd_mtx);
@@ -3398,26 +3397,28 @@ bs_dev_destroy(void *io_device)
 		pthread_cond_destroy(&bs->stream_upd_cond);
 		bs->stream_upd_tid_set = false;
 	}
-
+	
 	if(bs->cluster_stats) {
 		for(uint64_t i = 0; i < bs->total_clusters; i++) {
 			spdk_bit_array_free(&(bs->cluster_stats[i].pages));
-			pthread_spin_destroy(&(bs->cluster_stats[i].pages_lock));
+			pthread_spin_destroy(&(bs->cluster_stats[i].lock));
 		}
 		free(bs->cluster_stats);
 	}
 	if(bs->virtual_streams) {
 		for(uint32_t i = 0; i < bs->num_virtual_streams; i++) {
-			pthread_spin_destroy(&(bs->virtual_streams[i].stream_lock));
+			pthread_spin_destroy(&(bs->virtual_streams[i].lock));
 		}
 		free(bs->virtual_streams);
 	}
 	if(bs->physical_streams) {
 		for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-			pthread_spin_destroy(&(bs->physical_streams[i].stream_lock));
+			pthread_spin_destroy(&(bs->physical_streams[i].lock));
 		}
 		free(bs->physical_streams);
 	}
+
+	/** NOTE huhaosheng end */
 
 	bs->dev->destroy(bs->dev);
 
@@ -3630,10 +3631,10 @@ bs_stream_update_fn(void *arg) {
 			/**  Do work */ 
 			// FIRST: calculate and update every physical streams ratio (evict nums / visit nums)
 			for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-				pthread_spin_lock(&(bs->physical_streams[i].stream_lock));
+				pthread_spin_lock(&(bs->physical_streams[i].lock));
 				bs->physical_streams[i].ratio = (double)bs->physical_streams[i].total_evict_nums 
 											/ bs->physical_streams[i].total_visit_nums;
-				pthread_spin_unlock(&(bs->physical_streams[i].stream_lock));
+				pthread_spin_unlock(&(bs->physical_streams[i].lock));
 			}
 			// SECOND: re-calculate every virtual streams ratio and find the physical stream 
 			// whose ratio has minimum difference (min diff), 
@@ -3643,7 +3644,7 @@ bs_stream_update_fn(void *arg) {
 			// TODO : 0,1,2 virtual stream is fixed map to 0,1,2 physical stream
 			for(uint32_t i = 3; i < bs->num_virtual_streams; i++) {
 				// NOTE:  physical no lock cuz ratio only modify in this fn before
-				pthread_spin_lock(&(bs->virtual_streams[i].stream_lock));
+				pthread_spin_lock(&(bs->virtual_streams[i].lock));
 				// calculate virtual streams[i] ratio
 				ratio = (double)bs->virtual_streams[i].total_evict_nums \
 					/ bs->virtual_streams[i].total_visit_nums;
@@ -3671,17 +3672,17 @@ bs_stream_update_fn(void *arg) {
 				}
 				if(new_pstream_id != old_pstream_id) {
 					// if the map relationship changed, update the old physical stream's info
-					pthread_spin_lock(&(bs->physical_streams[old_pstream_id].stream_lock));
+					pthread_spin_lock(&(bs->physical_streams[old_pstream_id].lock));
 					bs->physical_streams[old_pstream_id].total_visit_nums -= bs->virtual_streams[i].total_visit_nums;
 					bs->physical_streams[old_pstream_id].total_evict_nums -= bs->virtual_streams[i].total_evict_nums;
-					pthread_spin_unlock(&(bs->physical_streams[old_pstream_id].stream_lock));
+					pthread_spin_unlock(&(bs->physical_streams[old_pstream_id].lock));
 					// if the map relationship changed, update the new physical stream's info
-					pthread_spin_lock(&(bs->physical_streams[new_pstream_id].stream_lock));
+					pthread_spin_lock(&(bs->physical_streams[new_pstream_id].lock));
 					bs->physical_streams[new_pstream_id].total_visit_nums += bs->virtual_streams[i].total_visit_nums;
 					bs->physical_streams[new_pstream_id].total_evict_nums += bs->virtual_streams[i].total_evict_nums;
-					pthread_spin_unlock(&(bs->physical_streams[new_pstream_id].stream_lock));
+					pthread_spin_unlock(&(bs->physical_streams[new_pstream_id].lock));
 				}
-				pthread_mutex_unlock(&(bs->virtual_streams[i].stream_lock));
+				pthread_spin_unlock(&(bs->virtual_streams[i].lock));
 			}
 		}
 	}
@@ -3798,10 +3799,11 @@ bs_alloc_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob
 	memcpy(&bs->bstype, &opts->bstype, sizeof(opts->bstype));
 
 	/* NOTE huhaosheng add start */
+	// NOTE init cluster stats
 	bs->cluster_stats = calloc(bs->total_clusters, sizeof(struct spdk_cluster_stats));
 	for(uint64_t i = 0; i < bs->total_clusters; i++) {
 		bs->cluster_stats[i].pages = spdk_bit_array_create(bs->pages_per_cluster);
-		pthread_spin_init(&(bs->cluster_stats[i].pages_lock), NULL);
+		pthread_spin_init(&(bs->cluster_stats[i].lock), 0);
 	}
 	bs->num_virtual_streams = opts->num_virtual_streams;
 	bs->num_physical_streams = opts->num_physical_streams;
@@ -3810,23 +3812,27 @@ bs_alloc_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob
 	// NOTE : init virtual stream and physical stream map relationship
 	// TODO : physical stream id == index or index+1, here is id == index
 	for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-		pthread_spin_init(&(bs->virtual_streams[i].stream_lock), NULL);
-		// seq init map relationship 
+		pthread_spin_init(&(bs->virtual_streams[i].lock), 0);
+		// //seq init map relationship 
+		/** TODO may do not need init map relationship */
 		bs->virtual_streams[i].physical_stream_id = i;
 	}
 	srand(time(NULL));
 	for(uint32_t i = bs->num_physical_streams; i < bs->num_virtual_streams; i++) {
-		pthread_spin_init(&(bs->virtual_streams[i].stream_lock), NULL);
-		// TODO : how many physical stream ids are fixed, here is 3
+		pthread_spin_init(&(bs->virtual_streams[i].lock), 0);
+		// // TODO : how many physical stream ids are fixed, here is 3
 		// random init the rest of map relationship
-		bs->virtual_streams[i].physical_stream_id = rand() % (bs->num_physical_streams - 3) + 3;
+		// bs->virtual_streams[i].physical_stream_id = rand() % (bs->num_physical_streams - 3) + 3;
+		/** TODO may do not need init map relationship */
+		bs->virtual_streams[i].physical_stream_id = rand() % (bs->num_physical_streams);
 	}
 
 	bs->physical_streams = calloc(bs->num_physical_streams, sizeof(struct spdk_physical_stream_info));
 	for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-		pthread_spin_init(&(bs->physical_streams[i].stream_lock), NULL);
+		pthread_spin_init(&(bs->physical_streams[i].lock), 0);
 	}
 
+	// NOTE init backgroud stream update thread
 	pthread_mutex_init(&bs->stream_upd_mtx, NULL);
 	pthread_cond_init(&bs->stream_upd_cond, NULL);
 	pthread_create(&(bs->stream_upd_thread_id), NULL, &bs_stream_update_fn, (void*)bs);
@@ -3866,17 +3872,17 @@ bs_alloc_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob
 		// free cluster stats
 		for(uint64_t i = 0; i < bs->total_clusters; i++) {
 			spdk_bit_array_free(&(bs->cluster_stats[i].pages));
-			pthread_spin_destroy(&(bs->cluster_stats[i].pages_lock));
+			pthread_spin_destroy(&(bs->cluster_stats[i].lock));
 		}
 		free(bs->cluster_stats);
 		// free virtual streams info
 		for(uint32_t i = 0; i < bs->num_virtual_streams; i++) {
-			pthread_spin_destroy(&(bs->virtual_streams[i].stream_lock));
+			pthread_spin_destroy(&(bs->virtual_streams[i].lock));
 		}
 		free(bs->virtual_streams);
 		// free physical streams info
 		for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-			pthread_spin_destroy(&(bs->physical_streams[i].stream_lock));
+			pthread_spin_destroy(&(bs->physical_streams[i].lock));
 		}
 		free(bs->physical_streams);
 		/* NOTE huhaosheng add end */
@@ -4998,6 +5004,8 @@ bs_opts_copy(struct spdk_bs_opts *src, struct spdk_bs_opts *dst)
 	SET_FIELD(num_md_pages);
 	SET_FIELD(max_md_ops);
 	SET_FIELD(max_channel_ops);
+	SET_FIELD(num_virtual_streams);
+	SET_FIELD(num_physical_streams);
 	SET_FIELD(clear_method);
 
 	if (FIELD_OK(bstype)) {
@@ -5010,7 +5018,7 @@ bs_opts_copy(struct spdk_bs_opts *src, struct spdk_bs_opts *dst)
 
 	/* You should not remove this statement, but need to update the assert statement
 	 * if you add a new field, and also add a corresponding SET_FIELD statement */
-	SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_opts) == 64, "Incorrect size");
+	SPDK_STATIC_ASSERT(sizeof(struct spdk_bs_opts) == 72, "Incorrect size");
 
 #undef FIELD_OK
 #undef SET_FIELD

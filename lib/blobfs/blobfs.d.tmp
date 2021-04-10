@@ -1,0 +1,41 @@
+blobfs.o: blobfs.c /home/denghejian/dir/spdk/include/spdk/stdinc.h \
+ /home/denghejian/dir/spdk/include/spdk/blobfs.h \
+ /home/denghejian/dir/spdk/include/spdk/blob.h tree.h \
+ /home/denghejian/dir/spdk/include/spdk/queue.h \
+ /home/denghejian/dir/spdk/include/spdk/queue_extras.h \
+ /home/denghejian/dir/spdk/include/spdk/util.h \
+ /home/denghejian/dir/spdk/include/spdk/thread.h \
+ /home/denghejian/dir/spdk/include/spdk/cpuset.h \
+ /home/denghejian/dir/spdk/include/spdk/assert.h \
+ /home/denghejian/dir/spdk/include/spdk/env.h \
+ /home/denghejian/dir/spdk/include/spdk/pci_ids.h \
+ /home/denghejian/dir/spdk/include/spdk/log.h \
+ /home/denghejian/dir/spdk/include/spdk/trace.h
+
+/home/denghejian/dir/spdk/include/spdk/stdinc.h:
+
+/home/denghejian/dir/spdk/include/spdk/blobfs.h:
+
+/home/denghejian/dir/spdk/include/spdk/blob.h:
+
+tree.h:
+
+/home/denghejian/dir/spdk/include/spdk/queue.h:
+
+/home/denghejian/dir/spdk/include/spdk/queue_extras.h:
+
+/home/denghejian/dir/spdk/include/spdk/util.h:
+
+/home/denghejian/dir/spdk/include/spdk/thread.h:
+
+/home/denghejian/dir/spdk/include/spdk/cpuset.h:
+
+/home/denghejian/dir/spdk/include/spdk/assert.h:
+
+/home/denghejian/dir/spdk/include/spdk/env.h:
+
+/home/denghejian/dir/spdk/include/spdk/pci_ids.h:
+
+/home/denghejian/dir/spdk/include/spdk/log.h:
+
+/home/denghejian/dir/spdk/include/spdk/trace.h:

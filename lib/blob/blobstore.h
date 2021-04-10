@@ -53,7 +53,7 @@
 #define SPDK_BLOB_BLOBID_HIGH_BIT (1ULL << 32)
 
 /** NOTE huhaosheng declared */
-#define SPDK_NUM_VIRTUAL_STREAMS 16      // num of virtual streams
+#define SPDK_NUM_VIRTUAL_STREAMS 32      // num of virtual streams
 #define SPDK_NUM_PHYSICAL_STREAMS 8      // num of physical streams
 #define SPDK_STREAM_UPDATE_TIMEOUT 60ul  // stream states update timeout seconds
 
@@ -186,21 +186,21 @@ struct spdk_virtual_stream_info
 	uint32_t physical_stream_id;
 	uint64_t total_visit_nums;
 	uint64_t total_evict_nums;
-	pthread_spinlock_t	 stream_lock; // NOTE : pthread_mutex_t change to pthread_spinlock_t
+	pthread_spinlock_t	 lock; // NOTE : pthread_mutex_t change to pthread_spinlock_t
 };
 struct spdk_physical_stream_info
 {
 	uint64_t total_visit_nums;
 	uint64_t total_evict_nums;
 	double ratio;
-	pthread_spinlock_t	 stream_lock;
+	pthread_spinlock_t	 lock;
 };
 
 // NOTE: huhaosheng declared
 struct spdk_cluster_stats {
 	uint64_t visit_nums;
 	uint64_t evict_nums;
-	pthread_spinlock_t	 pages_lock;
+	pthread_spinlock_t	 lock;
 	/* if pages per cluster == n , bitmap bits = n/8 */
 	/* page id = x, pages per cluster = n: (bits[x % n / 8] >> (x % n) % 8) & 0x01 */
 	// char bits[]; 
@@ -246,11 +246,11 @@ struct spdk_blob_store {
 	bool                            clean;
 
 	/* NOTE: for multi stream */
-	struct spdk_cluster_stats      *cluster_stats;
-	uint32_t 						num_virtual_streams;
-	uint32_t 						num_physical_streams;
-	struct spdk_virtual_stream_info        *virtual_streams;
-	struct spdk_physical_stream_info 	   *physical_streams;
+	struct spdk_cluster_stats      *cluster_stats;          	/** size = total_clusters */
+	uint32_t 						num_virtual_streams;		/** = SPDK_NUM_VIRTUAL_STREAMS */
+	uint32_t 						num_physical_streams;		/** = SPDK_NUM_PHYSICAL_STREAMS */
+	struct spdk_virtual_stream_info        *virtual_streams; 	/** size = num_virtual_streams */
+	struct spdk_physical_stream_info 	   *physical_streams;	/** size = num_physical_streams */
 
 	bool stream_upd_tid_set;
 	bool stream_upd_loop;
@@ -760,9 +760,9 @@ blob_get_pstream_id(struct spdk_blob *blob, uint32_t vstream_id) {
 	// TODO : failure
 	assert(vstream_id < blob->bs->num_virtual_streams);
 
-	pthread_spin_lock(&(blob->bs->virtual_streams[vstream_id].stream_lock));
+	pthread_spin_lock(&(blob->bs->virtual_streams[vstream_id].lock));
 	pstream_id = blob->bs->virtual_streams[vstream_id].physical_stream_id;
-	pthread_spin_unlock(&(blob->bs->virtual_streams[vstream_id].stream_lock));
+	pthread_spin_unlock(&(blob->bs->virtual_streams[vstream_id].lock));
 
 	return pstream_id;
 }

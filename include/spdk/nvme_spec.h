@@ -982,13 +982,6 @@ SPDK_STATIC_ASSERT(sizeof(union spdk_nvme_cmd_cdw10) == 4, "Incorrect size");
 union spdk_nvme_cmd_cdw11 {
 	uint32_t raw;
 
-	// NOTE denghejian: add Directive Command
-	struct {
-		uint32_t doper    : 8;
-		uint32_t dtype    : 8;
-		uint32_t dspec    : 16;
-	} directive;
-
 	struct {
 		/* NVM Set Identifier */
 		uint32_t nvmsetid  : 16;

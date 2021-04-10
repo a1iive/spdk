@@ -13,6 +13,7 @@
 	spdk_fs_file_stat;
 	spdk_fs_create_file;
 	spdk_fs_open_file;
+	spdk_fs_open_file_ms;
 	spdk_file_close;
 	spdk_fs_rename_file;
 	spdk_fs_delete_file;
@@ -34,7 +35,9 @@
 	spdk_file_writev_async;
 	spdk_fs_file_stat_async;
 	spdk_fs_create_file_async;
+	spdk_fs_create_file_async_ms;
 	spdk_fs_open_file_async;
+	spdk_fs_open_file_async_ms;
 	spdk_file_close_async;
 	spdk_fs_rename_file_async;
 	spdk_fs_delete_file_async;

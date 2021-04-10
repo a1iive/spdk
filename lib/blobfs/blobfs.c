@@ -119,6 +119,8 @@ struct spdk_file {
 	struct spdk_filesystem	*fs;
 	struct spdk_blob	*blob;
 	char			*name;
+	// NOTE huhaosheng defined
+	uint8_t 		file_type;
 	uint64_t		trace_arg_name;
 	uint64_t		length;
 	bool                    is_deleted;
@@ -135,6 +137,13 @@ struct spdk_file {
 	pthread_spinlock_t	lock;
 	struct cache_buffer	*last;
 	struct cache_tree	*tree;
+	// NOTE huhaosheng defined
+	/** file_type = 0, void type =  metadata_file_info*/
+	/** file_type = 1, void type =  log_file_info*/
+	/** file_type = 2, void type =  data_file_info*/
+	/** file_type = 3, void type =  index_file_info*/
+	void 			*file_info; 
+
 	TAILQ_HEAD(open_requests_head, spdk_fs_request) open_requests;
 	TAILQ_HEAD(sync_requests_head, spdk_fs_request) sync_requests;
 	TAILQ_ENTRY(spdk_file)	cache_tailq;
@@ -145,12 +154,65 @@ struct spdk_deleted_file {
 	TAILQ_ENTRY(spdk_deleted_file)	tailq;
 };
 
+// NOTE huhaosheng declared 
+#define CHUNK_SIZE 		1024 * 1024  /** partition file by chunk size */
+#define MAX_CHUNK_NUM 	10 * 1024   
+#define INDEX_VSTREAM_NUM 	4
+
+// NOTE huhaosheng defined
+struct spdk_metadata_file_info {
+	uint32_t vstream_id;
+	// struct spdk_file *file;
+	TAILQ_ENTRY(spdk_metadata_file_info) link;
+};
+
+// NOTE huhaosheng defined
+struct spdk_log_file_info {
+	uint32_t vstream_id;
+	// struct spdk_file *file;
+	TAILQ_ENTRY(spdk_log_file_info) link;
+};
+
+// NOTE huhaosheng defined
+struct spdk_data_file_info {
+	uint32_t upper_vid;  /** upper half offset vstream id */
+	uint32_t lower_vid;  /** lower half offset vstream id */
+	uint64_t point_offset;  /** dividing line of the whole offset space  */
+	// struct spdk_file *file;
+	/** cluster visit nums */
+	uint32_t cluster_visit_count[MAX_CHUNK_NUM];
+	TAILQ_ENTRY(spdk_data_file_info) link;
+};
+
+// NOTE huhaosheng defined
+struct spdk_index_file_info {
+	uint32_t start_vid;	/** the first of vstream ids. total INDEX_VSTREAM_NUM vstream ids */
+	// struct spdk_file *file;
+	// TODO cluster-vstream map
+	TAILQ_ENTRY(spdk_index_file_info) link;
+};
+
 struct spdk_filesystem {
 	struct spdk_blob_store	*bs;
 	TAILQ_HEAD(, spdk_file)	files;
 	struct spdk_bs_opts	bs_opts;
 	struct spdk_bs_dev	*bdev;
 	fs_send_request_fn	send_request;
+
+	/** NOTE huhaosheng declared start */
+	pthread_spinlock_t 				lock;			/** lock for g_vstream_id */
+	uint32_t						g_vstream_id; 	/** global vstream id */
+	// TAILQ_HEAD(, spdk_metadata_file_info) 	mdFiles;
+	// TAILQ_HEAD(, spdk_log_file_info) 		logFiles;
+	TAILQ_HEAD(, spdk_data_file_info) 		dFiles;
+	// TAILQ_HEAD(, spdk_index_file_info) 		iFiles;
+
+	bool point_upd_tid_set;
+	bool point_upd_loop;
+	pthread_t point_upd_thread_id;
+	pthread_mutex_t point_upd_mtx;
+	pthread_cond_t point_upd_cond;
+	/** huhaosheng declared end */
 
 	struct {
 		uint32_t		max_ops;
@@ -170,8 +232,6 @@ struct spdk_filesystem {
 };
 
 struct spdk_fs_cb_args {
-	/** NOTE huhaosheng declared */
-	uint32_t vstream_id;
 	union {
 		spdk_fs_op_with_handle_complete		fs_op_with_handle;
 		spdk_fs_op_complete			fs_op;
@@ -204,6 +264,8 @@ struct spdk_fs_cb_args {
 			uint64_t	start_lba;
 			uint64_t	num_lba;
 			uint32_t	blocklen;
+			/** NOTE huhaosheng declared */
+			uint32_t    vstream_id;
 		} rw;
 		struct {
 			const char	*old_name;
@@ -235,6 +297,8 @@ struct spdk_fs_cb_args {
 		} resize;
 		struct {
 			const char	*name;
+			// NOTE huhaosheng declared
+			uint8_t 	file_type;
 			uint32_t	flags;
 			TAILQ_ENTRY(spdk_fs_request)	tailq;
 		} open;
@@ -551,6 +615,50 @@ init_cb(void *ctx, struct spdk_blob_store *bs, int bserrno)
 	free_fs_request(req);
 }
 
+#define POINT_UPDATE_TIMEOUT 60ul
+
+// NOTE huhaosheng defined
+/**
+ * Periodically update data files point 
+ * in background thread
+ */
+static void *
+fs_point_update_fn(void *arg) {
+	struct spdk_filesystem * fs = arg;
+	fs->point_upd_loop = true;
+	struct timespec			ts;
+	uint64_t now, timeout;
+	int rc;
+
+	pthread_mutex_lock(&fs->point_upd_mtx);
+	while(fs->point_upd_loop) {
+		
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		now = spdk_get_ticks();
+		timeout = now + (POINT_UPDATE_TIMEOUT * spdk_get_ticks_hz()) / SPDK_SEC_TO_NSEC;
+
+		if (timeout > now) {
+			timeout = ((timeout - now) * SPDK_SEC_TO_NSEC) / spdk_get_ticks_hz() +
+				ts.tv_sec * SPDK_SEC_TO_NSEC + ts.tv_nsec;
+
+			ts.tv_sec  = timeout / SPDK_SEC_TO_NSEC;
+			ts.tv_nsec = timeout % SPDK_SEC_TO_NSEC;
+		}
+		
+		rc = pthread_cond_timedwait((&fs->point_upd_cond), &fs->point_upd_mtx, &ts);
+		if (rc != ETIMEDOUT) {
+			break;
+		}
+		if(fs->point_upd_loop) {
+			/**  Do work */ 
+			
+			
+		}
+	}
+	pthread_mutex_unlock(&fs->point_upd_mtx);
+	
+}
+
 static struct spdk_filesystem *
 fs_alloc(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn)
 {
@@ -560,6 +668,20 @@ fs_alloc(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn)
 	if (fs == NULL) {
 		return NULL;
 	}
+
+	/** NOTE huhaosheng defined start */
+	if(pthread_spin_init(&fs->lock, 0)) {
+		free(fs);
+		return NULL;
+	}
+	fs->g_vstream_id = 0;
+	TAILQ_INIT(&fs->dFiles);
+
+	pthread_mutex_init(&fs->point_upd_mtx, NULL);
+	pthread_cond_init(&fs->point_upd_cond, NULL);
+	pthread_create(&(fs->point_upd_thread_id), NULL, &fs_point_update_fn, (void*)fs);
+	fs->point_upd_tid_set = true;
+	/** huhaosheng defiend end */
 
 	fs->bdev = dev;
 	fs->send_request = send_request_fn;
@@ -632,6 +754,73 @@ spdk_fs_init(struct spdk_bs_dev *dev, struct spdk_blobfs_opts *opt,
 	}
 	// NOTE huhaosheng changed
 	spdk_bs_init_ms(dev, &opts, init_cb, req);
+}
+
+// NOTE huhaosheng defined
+static struct spdk_file *
+file_alloc_ms(struct spdk_filesystem *fs, uint8_t file_type)
+{
+	struct spdk_file *file;
+
+	file = calloc(1, sizeof(*file));
+	if (file == NULL) {
+		return NULL;
+	}
+
+	file->tree = calloc(1, sizeof(*file->tree));
+	if (file->tree == NULL) {
+		free(file);
+		return NULL;
+	}
+
+	if (pthread_spin_init(&file->lock, 0)) {
+		free(file->tree);
+		free(file);
+		return NULL;
+	}
+
+	file->fs = fs;
+	TAILQ_INIT(&file->open_requests);
+	TAILQ_INIT(&file->sync_requests);
+	TAILQ_INSERT_TAIL(&fs->files, file, tailq);
+	file->priority = SPDK_FILE_PRIORITY_LOW;
+
+	// NOTE huhaosheng added
+	file->file_type = file_type;
+	if(file_type == 0) {
+		// matadata file
+		struct spdk_metadata_file_info *file_info = calloc(1, sizeof(struct spdk_metadata_file_info));
+		pthread_spin_lock(&(fs->lock));
+		file_info->vstream_id = fs->g_vstream_id++;
+		pthread_spin_unlock(&(fs->lock));
+		file->file_info = file_info;
+	} else if(file_type == 1) {
+		// log file
+		struct spdk_log_file_info *file_info = calloc(1, sizeof(struct spdk_log_file_info));
+		pthread_spin_lock(&(fs->lock));
+		file_info->vstream_id = fs->g_vstream_id++;
+		pthread_spin_unlock(&(fs->lock));
+		file->file_info = file_info;
+	} else if(file_type == 2) {
+		// data file
+		struct spdk_data_file_info *file_info = calloc(1, sizeof(struct spdk_data_file_info));
+		pthread_spin_lock(&(fs->lock));
+		file_info->upper_vid = fs->g_vstream_id++;
+		file_info->lower_vid = fs->g_vstream_id++;
+		pthread_spin_unlock(&(fs->lock));
+		TAILQ_INSERT_TAIL(&fs->dFiles, file_info, link);
+		file->file_info = file_info;
+	} else {
+		// index file
+		struct spdk_index_file_info *file_info = calloc(1, sizeof(struct spdk_index_file_info));
+		pthread_spin_lock(&(fs->lock));
+		// TODO 
+		file_info->start_vid = fs->g_vstream_id;
+		fs->g_vstream_id += INDEX_VSTREAM_NUM;
+		pthread_spin_unlock(&(fs->lock));
+		file->file_info = file_info;
+	}
+	return file;
 }
 
 static struct spdk_file *
@@ -883,11 +1072,32 @@ unload_cb(void *ctx, int bserrno)
 	struct spdk_filesystem *fs = args->fs;
 	struct spdk_file *file, *tmp;
 
+	/** NOTE huhaosheng defined start */
+	// close pthread first
+	if(fs->point_upd_tid_set) {
+		pthread_mutex_lock(&fs->point_upd_mtx);
+		fs->point_upd_loop = false;
+		pthread_cond_signal(&fs->point_upd_cond);
+		pthread_mutex_unlock(&fs->point_upd_mtx);
+		pthread_join(fs->point_upd_thread_id, NULL);
+
+		pthread_mutex_destroy(&fs->point_upd_mtx);
+		pthread_cond_destroy(&fs->point_upd_cond);
+		fs->point_upd_tid_set = false;
+	}
+		
+	struct spdk_data_file_info *file_info, *tmp_info;
+
+	TAILQ_FOREACH_SAFE(file_info, &fs->dFiles, link, tmp_info) {
+		TAILQ_REMOVE(&fs->dFiles, file_info, link);
+	}
+	pthread_spin_destroy(&fs->lock);
+
+	/** huhaosheng defined end */
 	TAILQ_FOREACH_SAFE(file, &fs->files, tailq, tmp) {
 		TAILQ_REMOVE(&fs->files, file, tailq);
 		file_free(file);
 	}
-
 	free_global_cache();
 
 	args->fn.fs_op(args->arg, bserrno);
@@ -1075,6 +1285,50 @@ fs_create_blob_create_cb(void *ctx, spdk_blob_id blobid, int bserrno)
 	spdk_bs_open_blob(f->fs->bs, blobid, fs_create_blob_open_cb, req);
 }
 
+// NOTE huaosheng defined
+void
+spdk_fs_create_file_async_ms(struct spdk_filesystem *fs, const char *name, uint8_t file_type,
+			  spdk_file_op_complete cb_fn, void *cb_arg)
+{
+	struct spdk_file *file;
+	struct spdk_fs_request *req;
+	struct spdk_fs_cb_args *args;
+
+	if (strnlen(name, SPDK_FILE_NAME_MAX + 1) == SPDK_FILE_NAME_MAX + 1) {
+		cb_fn(cb_arg, -ENAMETOOLONG);
+		return;
+	}
+
+	file = fs_find_file(fs, name);
+	if (file != NULL) {
+		cb_fn(cb_arg, -EEXIST);
+		return;
+	}
+
+	file = file_alloc_ms(fs, file_type);
+	if (file == NULL) {
+		SPDK_ERRLOG("Cannot allocate new file for creation\n");
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	req = alloc_fs_request(fs->md_target.md_fs_channel);
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot allocate create async req for file=%s\n", name);
+		cb_fn(cb_arg, -ENOMEM);
+		return;
+	}
+
+	args = &req->args;
+	args->file = file;
+	args->fn.file_op = cb_fn;
+	args->arg = cb_arg;
+
+	file->name = strdup(name);
+	_file_build_trace_arg_name(file);
+	spdk_bs_create_blob(fs->bs, fs_create_blob_create_cb, args);
+}
+
 void
 spdk_fs_create_file_async(struct spdk_filesystem *fs, const char *name,
 			  spdk_file_op_complete cb_fn, void *cb_arg)
@@ -1219,6 +1473,52 @@ fs_open_blob_create_cb(void *ctx, int bserrno)
 	}
 }
 
+// NOTE huhaosheng defined 
+void
+spdk_fs_open_file_async_ms(struct spdk_filesystem *fs, const char *name, uint32_t flags, uint8_t file_type,
+			spdk_file_op_with_handle_complete cb_fn, void *cb_arg)
+{
+	struct spdk_file *f = NULL;
+	struct spdk_fs_request *req;
+	struct spdk_fs_cb_args *args;
+
+	if (strnlen(name, SPDK_FILE_NAME_MAX + 1) == SPDK_FILE_NAME_MAX + 1) {
+		cb_fn(cb_arg, NULL, -ENAMETOOLONG);
+		return;
+	}
+
+	f = fs_find_file(fs, name);
+	if (f == NULL && !(flags & SPDK_BLOBFS_OPEN_CREATE)) {
+		cb_fn(cb_arg, NULL, -ENOENT);
+		return;
+	}
+
+	if (f != NULL && f->is_deleted == true) {
+		cb_fn(cb_arg, NULL, -ENOENT);
+		return;
+	}
+
+	req = alloc_fs_request(fs->md_target.md_fs_channel);
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot allocate async open req for file=%s\n", name);
+		cb_fn(cb_arg, NULL, -ENOMEM);
+		return;
+	}
+
+	args = &req->args;
+	args->fn.file_op_with_handle = cb_fn;
+	args->arg = cb_arg;
+	args->file = f;
+	args->fs = fs;
+	args->op.open.name = name;
+
+	if (f == NULL) {
+		spdk_fs_create_file_async_ms(fs, name, file_type, fs_open_blob_create_cb, req);
+	} else {
+		fs_open_blob_create_cb(req, 0);
+	}
+}
+
 void
 spdk_fs_open_file_async(struct spdk_filesystem *fs, const char *name, uint32_t flags,
 			spdk_file_op_with_handle_complete cb_fn, void *cb_arg)
@@ -1275,6 +1575,18 @@ __fs_open_file_done(void *arg, struct spdk_file *file, int bserrno)
 	SPDK_DEBUGLOG(blobfs, "file=%s\n", args->op.open.name);
 }
 
+// NOTE huhaosheng defined
+static void
+__fs_open_file_ms(void *arg)
+{
+	struct spdk_fs_request *req = arg;
+	struct spdk_fs_cb_args *args = &req->args;
+
+	SPDK_DEBUGLOG(blobfs, "file=%s\n", args->op.open.name);
+	spdk_fs_open_file_async_ms(args->fs, args->op.open.name, args->op.open.flags, args->op.open.file_type,
+				__fs_open_file_done, req);
+}
+
 static void
 __fs_open_file(void *arg)
 {
@@ -1284,6 +1596,44 @@ __fs_open_file(void *arg)
 	SPDK_DEBUGLOG(blobfs, "file=%s\n", args->op.open.name);
 	spdk_fs_open_file_async(args->fs, args->op.open.name, args->op.open.flags,
 				__fs_open_file_done, req);
+}
+
+// NOTE huhaosheng defined
+int
+spdk_fs_open_file_ms(struct spdk_filesystem *fs, struct spdk_fs_thread_ctx *ctx,
+		  const char *name, uint32_t flags, struct spdk_file **file, uint8_t file_type)
+{
+	struct spdk_fs_channel *channel = (struct spdk_fs_channel *)ctx;
+	struct spdk_fs_request *req;
+	struct spdk_fs_cb_args *args;
+	int rc;
+
+	SPDK_DEBUGLOG(blobfs, "file=%s\n", name);
+
+	req = alloc_fs_request(channel);
+	if (req == NULL) {
+		SPDK_ERRLOG("Cannot allocate req for opening file=%s\n", name);
+		return -ENOMEM;
+	}
+
+	args = &req->args;
+	args->fs = fs;
+	args->op.open.name = name;
+	args->op.open.flags = flags;
+	// NOTE huhaosheng declared
+	args->op.open.file_type = file_type;
+	args->sem = &channel->sem;
+	fs->send_request(__fs_open_file_ms, req);
+	sem_wait(&channel->sem);
+	rc = args->rc;
+	if (rc == 0) {
+		*file = args->file;
+	} else {
+		*file = NULL;
+	}
+	free_fs_request(req);
+
+	return rc;
 }
 
 int
@@ -1512,6 +1862,10 @@ spdk_fs_delete_file_async(struct spdk_filesystem *fs, const char *name,
 
 	blobid = f->blobid;
 	TAILQ_REMOVE(&fs->files, f, tailq);
+	
+	// NOTE huhaosheng defined
+	struct spdk_data_file_info *file_info = (struct spdk_data_file_info *)f->file_info;
+	if(f->file_type == 3 && file_info) TAILQ_REMOVE(&fs->dFiles, file_info, link);
 
 	file_free(f);
 
@@ -1772,7 +2126,6 @@ __read_done_ms(void *ctx, int bserrno)
 {
 	struct spdk_fs_request *req = ctx;
 	struct spdk_fs_cb_args *args = &req->args;
-	uint64_t vstream_id = args->vstream_id;
 	void *buf;
 
 	assert(req != NULL);
@@ -1784,7 +2137,7 @@ __read_done_ms(void *ctx, int bserrno)
 		_copy_iovs_to_buf(buf, args->op.rw.length, args->iovs, args->iovcnt);
 		spdk_blob_io_write_ms(args->file->blob, args->op.rw.channel,
 				   args->op.rw.pin_buf,
-				   args->op.rw.start_lba, args->op.rw.num_lba, vstream_id,
+				   args->op.rw.start_lba, args->op.rw.num_lba, args->op.rw.vstream_id,
 				   __rw_done, req);
 	}
 }
@@ -1928,7 +2281,7 @@ __readvwritev_ms(struct spdk_file *file, struct spdk_io_channel *_channel,
 	args->op.rw.start_lba = start_lba;
 	args->op.rw.num_lba = num_lba;
 
-	args->vstream_id = vstream_id;
+	args->op.rw.vstream_id = vstream_id;
 
 	if (!is_read && file->length < offset + length) {
 		// NOTE huhaosheng changed 
@@ -1938,7 +2291,7 @@ __readvwritev_ms(struct spdk_file *file, struct spdk_io_channel *_channel,
 		// NOTE huhaosheng changed
 		spdk_blob_io_write_ms(args->file->blob, args->op.rw.channel,
 				   args->op.rw.pin_buf,
-				   args->op.rw.start_lba, args->op.rw.num_lba, vstream_id,
+				   args->op.rw.start_lba, args->op.rw.num_lba, args->op.rw.vstream_id,
 				   __rw_done, req);
 	} else {
 		// NOTE huhaosheng changed
@@ -2545,7 +2898,7 @@ __rw_from_file_ms(void *ctx)
 				     __rw_from_file_done, req);
 	} else {
 		spdk_file_write_async_ms(file, file->fs->sync_target.sync_io_channel, args->iovs[0].iov_base,
-				      args->op.rw.offset, (uint64_t)args->iovs[0].iov_len, args->vstream_id,
+				      args->op.rw.offset, (uint64_t)args->iovs[0].iov_len, args->op.rw.vstream_id,
 				      __rw_from_file_done, req);
 	}
 }
@@ -2595,9 +2948,9 @@ __send_rw_from_file_ms(struct spdk_file *file, void *payload,
 	args->iovs[0].iov_len = (size_t)length;
 	args->op.rw.offset = offset;
 	args->op.rw.is_read = is_read;
-	args->rwerrno = &arg->rwerrno;
 	// NOTE huhaosheng declared
-	args->vstream_id = vstream_id;
+	args->op.rw.vstream_id = vstream_id;
+	args->rwerrno = &arg->rwerrno;
 	file->fs->send_request(__rw_from_file_ms, req);
 	return 0;
 }
@@ -2630,7 +2983,7 @@ __send_rw_from_file(struct spdk_file *file, void *payload,
 
 // NOTE huhaosheng defined
 int
-spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx, uint32_t vstream_id,
+spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		void *payload, uint64_t offset, uint64_t length)
 {
 	struct spdk_fs_channel *channel = (struct spdk_fs_channel *)ctx;
@@ -3189,6 +3542,7 @@ _file_free(void *ctx)
 
 	free(file->name);
 	free(file->tree);
+	if(file->file_info) free(file->file_info); // NOTE huhaosheng defined
 	free(file);
 }
 
@@ -3201,6 +3555,7 @@ file_free(struct spdk_file *file)
 		pthread_spin_unlock(&file->lock);
 		free(file->name);
 		free(file->tree);
+		if(file->file_info) free(file->file_info); // NOTE huhaosheng defined
 		free(file);
 		return;
 	}
