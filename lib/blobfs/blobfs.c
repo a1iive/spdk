@@ -156,7 +156,8 @@ struct spdk_deleted_file {
 
 // NOTE huhaosheng declared 
 #define CHUNK_SIZE 		1024 * 1024  /** partition file by chunk size */
-#define MAX_CHUNK_NUM 	10 * 1024   
+#define MAX_CHUNK_NUM 	10ul * 1024   
+#define WINDOW_RATIO	10
 #define INDEX_VSTREAM_NUM 	4
 
 // NOTE huhaosheng defined
@@ -177,10 +178,10 @@ struct spdk_log_file_info {
 struct spdk_data_file_info {
 	uint32_t upper_vid;  /** upper half offset vstream id */
 	uint32_t lower_vid;  /** lower half offset vstream id */
-	uint64_t point_offset;  /** dividing line of the whole offset space  */
-	// struct spdk_file *file;
-	/** cluster visit nums */
-	uint32_t cluster_visit_count[MAX_CHUNK_NUM];
+	uint64_t boundary_offset;  /** dividing line of the whole offset space  */
+	struct spdk_file *file;
+	/** chunk visit nums */
+	uint32_t chunk_visit_count[MAX_CHUNK_NUM];
 	TAILQ_ENTRY(spdk_data_file_info) link;
 };
 
@@ -207,11 +208,11 @@ struct spdk_filesystem {
 	TAILQ_HEAD(, spdk_data_file_info) 		dFiles;
 	// TAILQ_HEAD(, spdk_index_file_info) 		iFiles;
 
-	bool point_upd_tid_set;
-	bool point_upd_loop;
-	pthread_t point_upd_thread_id;
-	pthread_mutex_t point_upd_mtx;
-	pthread_cond_t point_upd_cond;
+	bool boundary_upd_tid_set;
+	bool boundary_upd_loop;
+	pthread_t boundary_upd_thread_id;
+	pthread_mutex_t boundary_upd_mtx;
+	pthread_cond_t boundary_upd_cond;
 	/** huhaosheng declared end */
 
 	struct {
@@ -615,27 +616,67 @@ init_cb(void *ctx, struct spdk_blob_store *bs, int bserrno)
 	free_fs_request(req);
 }
 
-#define POINT_UPDATE_TIMEOUT 60ul
+// NOTE huhaosheng defined
+#define BOUNDARY_UPDATE_TIMEOUT 60ul
+#define BOUNDARY_RATIO			0.5
+/** check whether the offset boundary is in the slide window
+ * \return 	if it is boundary, return true
+ */
+static bool 
+check_boundary(struct spdk_data_file_info *file_info, size_t index, uint64_t window_size) {
+	uint64_t lower_visit_nums = 0, upper_visit_nums = 0;
+	size_t i = 0;
+	while(i < (window_size >> 1)) {
+		lower_visit_nums += file_info->chunk_visit_count[index+i];
+		++i;
+	}
+	while(i < window_size) {
+		upper_visit_nums += file_info->chunk_visit_count[index+i];
+		++i;
+	}
+	if(lower_visit_nums > upper_visit_nums) {
+		return (double)(lower_visit_nums - upper_visit_nums)/(lower_visit_nums) > BOUNDARY_RATIO;
+	}else {
+		return (double)(upper_visit_nums - lower_visit_nums)/(upper_visit_nums) > BOUNDARY_RATIO;
+	}
+}
+
+// update offset boundary
+static uint64_t
+update_boundary(struct spdk_data_file_info *file_info) {
+	uint64_t chunk_num = file_info->file->length / CHUNK_SIZE;
+	uint64_t window_size = chunk_num / WINDOW_RATIO;
+	uint64_t boundary_off = file_info->file->length;
+	size_t i = 0;
+	while(i <= (chunk_num - window_size) && !check_boundary(file_info, i, window_size)) {
+		i = i + (window_size >> 1);
+	}
+	while(i <= (chunk_num - window_size) && !check_boundary(file_info, i, window_size)) {
+		++i;
+	}
+	boundary_off = min(boundary_off, (i + window_size >> 1) * CHUNK_SIZE);
+	return boundary_off;
+}
 
 // NOTE huhaosheng defined
 /**
- * Periodically update data files point 
+ * Periodically update data files boundary 
  * in background thread
  */
 static void *
-fs_point_update_fn(void *arg) {
+fs_boundary_update_fn(void *arg) {
 	struct spdk_filesystem * fs = arg;
-	fs->point_upd_loop = true;
+	fs->boundary_upd_loop = true;
 	struct timespec			ts;
 	uint64_t now, timeout;
 	int rc;
 
-	pthread_mutex_lock(&fs->point_upd_mtx);
-	while(fs->point_upd_loop) {
+	pthread_mutex_lock(&fs->boundary_upd_mtx);
+	while(fs->boundary_upd_loop) {
 		
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		now = spdk_get_ticks();
-		timeout = now + (POINT_UPDATE_TIMEOUT * spdk_get_ticks_hz()) / SPDK_SEC_TO_NSEC;
+		timeout = now + (BOUNDARY_UPDATE_TIMEOUT * spdk_get_ticks_hz()) / SPDK_SEC_TO_NSEC;
 
 		if (timeout > now) {
 			timeout = ((timeout - now) * SPDK_SEC_TO_NSEC) / spdk_get_ticks_hz() +
@@ -645,17 +686,22 @@ fs_point_update_fn(void *arg) {
 			ts.tv_nsec = timeout % SPDK_SEC_TO_NSEC;
 		}
 		
-		rc = pthread_cond_timedwait((&fs->point_upd_cond), &fs->point_upd_mtx, &ts);
+		rc = pthread_cond_timedwait((&fs->boundary_upd_cond), &fs->boundary_upd_mtx, &ts);
 		if (rc != ETIMEDOUT) {
 			break;
 		}
-		if(fs->point_upd_loop) {
+		if(fs->boundary_upd_loop) {
 			/**  Do work */ 
-			
-			
+			struct spdk_data_file_info *file_info;
+			TAILQ_FOREACH(file_info, &fs->dFiles, link) {
+				// FIXME whether need lock
+				pthread_spin_lock(&file_info->file->lock);
+				file_info->boundary_offset = update_boundary(file_info);
+				pthread_spin_unlock(&file_info->file->lock);
+			}
 		}
 	}
-	pthread_mutex_unlock(&fs->point_upd_mtx);
+	pthread_mutex_unlock(&fs->boundary_upd_mtx);
 	
 }
 
@@ -677,10 +723,10 @@ fs_alloc(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn)
 	fs->g_vstream_id = 0;
 	TAILQ_INIT(&fs->dFiles);
 
-	pthread_mutex_init(&fs->point_upd_mtx, NULL);
-	pthread_cond_init(&fs->point_upd_cond, NULL);
-	pthread_create(&(fs->point_upd_thread_id), NULL, &fs_point_update_fn, (void*)fs);
-	fs->point_upd_tid_set = true;
+	pthread_mutex_init(&fs->boundary_upd_mtx, NULL);
+	pthread_cond_init(&fs->boundary_upd_cond, NULL);
+	pthread_create(&(fs->boundary_upd_thread_id), NULL, &fs_boundary_update_fn, (void*)fs);
+	fs->boundary_upd_tid_set = true;
 	/** huhaosheng defiend end */
 
 	fs->bdev = dev;
@@ -808,7 +854,9 @@ file_alloc_ms(struct spdk_filesystem *fs, uint8_t file_type)
 		file_info->upper_vid = fs->g_vstream_id++;
 		file_info->lower_vid = fs->g_vstream_id++;
 		pthread_spin_unlock(&(fs->lock));
+		// FIXME whether dFiles need lock
 		TAILQ_INSERT_TAIL(&fs->dFiles, file_info, link);
+		file_info->file = file;
 		file->file_info = file_info;
 	} else {
 		// index file
@@ -1074,16 +1122,16 @@ unload_cb(void *ctx, int bserrno)
 
 	/** NOTE huhaosheng defined start */
 	// close pthread first
-	if(fs->point_upd_tid_set) {
-		pthread_mutex_lock(&fs->point_upd_mtx);
-		fs->point_upd_loop = false;
-		pthread_cond_signal(&fs->point_upd_cond);
-		pthread_mutex_unlock(&fs->point_upd_mtx);
-		pthread_join(fs->point_upd_thread_id, NULL);
+	if(fs->boundary_upd_tid_set) {
+		pthread_mutex_lock(&fs->boundary_upd_mtx);
+		fs->boundary_upd_loop = false;
+		pthread_cond_signal(&fs->boundary_upd_cond);
+		pthread_mutex_unlock(&fs->boundary_upd_mtx);
+		pthread_join(fs->boundary_upd_thread_id, NULL);
 
-		pthread_mutex_destroy(&fs->point_upd_mtx);
-		pthread_cond_destroy(&fs->point_upd_cond);
-		fs->point_upd_tid_set = false;
+		pthread_mutex_destroy(&fs->boundary_upd_mtx);
+		pthread_cond_destroy(&fs->boundary_upd_cond);
+		fs->boundary_upd_tid_set = false;
 	}
 		
 	struct spdk_data_file_info *file_info, *tmp_info;
@@ -3001,10 +3049,50 @@ spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 	arg.rwerrno = 0;
 	file->append_pos += length;
 	pthread_spin_unlock(&file->lock);
+
+	/** NOTE huhaosheng added start */
+	uint32_t vstream_id;
+	if(file->file_type == 0) {
+		// metadata file
+		struct spdk_metadata_file_info *file_info = (struct spdk_metadata_file_info*)file->file_info;
+		vstream_id = file_info->vstream_id;
+	} else if(file->file_type == 1) {
+		// log file
+		struct spdk_log_file_info *file_info = (struct spdk_log_file_info*)file->file_info;
+		vstream_id = file_info->vstream_id;
+	} else if(file->file_type == 2) {
+		// data file
+		// FIXME maybe need lock
+		struct spdk_data_file_info *file_info = (struct spdk_data_file_info*)file->file_info;
+		if(offset > file_info->boundary_offset) vstream_id = file_info->upper_vid;
+		else vstream_id = file_info->lower_vid;
+	} else {
+		// index file
+		// TODO autoStream
+		struct spdk_index_file_info *file_info = (struct spdk_index_file_info*)file->file_info;
+		vstream_id = file_info->start_vid;
+	}
+	/** huhaosheng added end */
+
 	rc = __send_rw_from_file_ms(file, payload, offset, length, false, vstream_id, &arg);
 	if (rc != 0) {
 		return rc;
 	}
+
+	/** NOTE huhaosheng added start */
+	// update data file info
+	if(file->file_type == 2) {
+		size_t index = offset / CHUNK_SIZE;
+		size_t nums = length / CHUNK_SIZE;
+		struct spdk_data_file_info *file_info = (struct spdk_data_file_info*)file->file_info;
+		pthread_spin_lock(&file->lock);
+		for(size_t i = 0; i < nums; i++) {
+			file_info->chunk_visit_count[index+i]++;
+		}
+		pthread_spin_unlock(&file->lock);
+	}
+	/** huhaosheng added end */
+
 	sem_wait(&channel->sem);
 	return arg.rwerrno;
 }
