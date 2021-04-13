@@ -53,9 +53,9 @@
 #define SPDK_BLOB_BLOBID_HIGH_BIT (1ULL << 32)
 
 /** NOTE huhaosheng declared */
-#define SPDK_NUM_VIRTUAL_STREAMS 32      // num of virtual streams
-#define SPDK_NUM_PHYSICAL_STREAMS 8      // num of physical streams
-#define SPDK_STREAM_UPDATE_TIMEOUT 60ul  // stream states update timeout seconds
+#define SPDK_NUM_VIRTUAL_STREAMS 	256      // num of virtual streams
+#define SPDK_NUM_PHYSICAL_STREAMS	32       // num of physical streams
+#define SPDK_STREAM_UPDATE_TIMEOUT	60ul 	 // stream states update timeout (s)
 
 struct spdk_xattr {
 	uint32_t	index;

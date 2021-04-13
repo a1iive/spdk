@@ -30,6 +30,7 @@
  *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <sys/time.h>
 
 #include "spdk/stdinc.h"
 
@@ -2717,7 +2718,7 @@ blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_cou
 		io_units_per_cluster = io_units_per_page * pages_per_cluster;
 	}
 
-	int cluster_index = lba / io_units_per_cluster;
+	int cluster_index = lba / io_units_per_cluster; // 	bs_lba_to_cluster
 
 	page = bs_io_unit_to_page(blob->bs, lba);
 	assert(page < blob->bs->total_clusters * pages_per_cluster);
@@ -3605,23 +3606,19 @@ bs_stream_update_fn(void *arg) {
 	struct spdk_blob_store * bs = arg;
 	bs->stream_upd_loop = true;
 	struct timespec			ts;
-	uint64_t now, timeout;
+	struct timeval now;
 	int rc;
 
 	pthread_mutex_lock(&bs->stream_upd_mtx);
 	while(bs->stream_upd_loop) {
-		
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		now = spdk_get_ticks();
-		timeout = now + (SPDK_STREAM_UPDATE_TIMEOUT * spdk_get_ticks_hz()) / SPDK_SEC_TO_NSEC;
-
-		if (timeout > now) {
-			timeout = ((timeout - now) * SPDK_SEC_TO_NSEC) / spdk_get_ticks_hz() +
-				ts.tv_sec * SPDK_SEC_TO_NSEC + ts.tv_nsec;
-
-			ts.tv_sec  = timeout / SPDK_SEC_TO_NSEC;
-			ts.tv_nsec = timeout % SPDK_SEC_TO_NSEC;
+		if (gettimeofday(&now, NULL) < 0) {
+			printf("Cannot get current time\n");
+			break;
 		}
+		
+		ts.tv_nsec = (now.tv_usec * 1000) % 1000000000;
+		ts.tv_sec = now.tv_sec + SPDK_STREAM_UPDATE_TIMEOUT +
+				(now.tv_usec * 1000) / 1000000000;
 		
 		rc = pthread_cond_timedwait((&bs->stream_upd_cond), &bs->stream_upd_mtx, &ts);
 		if (rc != ETIMEDOUT) {
@@ -3629,6 +3626,7 @@ bs_stream_update_fn(void *arg) {
 		}
 		if(bs->stream_upd_loop) {
 			/**  Do work */ 
+			printf("bs_stream_update_fn do work once!\n");
 			// FIRST: calculate and update every physical streams ratio (evict nums / visit nums)
 			for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
 				pthread_spin_lock(&(bs->physical_streams[i].lock));
@@ -3641,8 +3639,7 @@ bs_stream_update_fn(void *arg) {
 			// then change the physical stream mapped by virtual stream if needed
 			double ratio, min_diff, diff;
 			uint32_t new_pstream_id, old_pstream_id;
-			// TODO : 0,1,2 virtual stream is fixed map to 0,1,2 physical stream
-			for(uint32_t i = 3; i < bs->num_virtual_streams; i++) {
+			for(uint32_t i = 0; i < bs->num_virtual_streams; i++) {
 				// NOTE:  physical no lock cuz ratio only modify in this fn before
 				pthread_spin_lock(&(bs->virtual_streams[i].lock));
 				// calculate virtual streams[i] ratio
@@ -3657,8 +3654,7 @@ bs_stream_update_fn(void *arg) {
 					ratio - bs->physical_streams[old_pstream_id].ratio : \
 					bs->physical_streams[old_pstream_id].ratio - ratio;
 				// calculate all the ratio diff with all optional physical streams (except fixed 0,1,2)
-				// TODO : 0,1,2 physical stream is fixed
-				for(uint32_t j = 3; j < bs->num_physical_streams; j++) {
+				for(uint32_t j = 0; j < bs->num_physical_streams; j++) {
 					if(j != bs->virtual_streams[i].physical_stream_id) {
 						// calculate the ratio diff between the virtual stream and the physical stream 
 						diff = ratio > bs->physical_streams[j].ratio ? \
@@ -3687,7 +3683,7 @@ bs_stream_update_fn(void *arg) {
 		}
 	}
 	pthread_mutex_unlock(&bs->stream_upd_mtx);
-	
+	return NULL;
 }
 
 /* START spdk_bs_load */
@@ -3833,10 +3829,10 @@ bs_alloc_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob
 	}
 
 	// NOTE init backgroud stream update thread
-	pthread_mutex_init(&bs->stream_upd_mtx, NULL);
-	pthread_cond_init(&bs->stream_upd_cond, NULL);
-	pthread_create(&(bs->stream_upd_thread_id), NULL, &bs_stream_update_fn, (void*)bs);
-	bs->stream_upd_tid_set = true;
+	// pthread_mutex_init(&bs->stream_upd_mtx, NULL);
+	// pthread_cond_init(&bs->stream_upd_cond, NULL);
+	// pthread_create(&(bs->stream_upd_thread_id), NULL, &bs_stream_update_fn, (void*)bs);
+	bs->stream_upd_tid_set = false;
 	/* NOTE huhaosheng add end */
 
 	/* The metadata is assumed to be at least 1 page */

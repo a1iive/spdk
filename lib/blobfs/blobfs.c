@@ -30,6 +30,7 @@
  *   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  *   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#include <sys/time.h>
 
 #include "spdk/stdinc.h"
 
@@ -617,7 +618,7 @@ init_cb(void *ctx, struct spdk_blob_store *bs, int bserrno)
 }
 
 // NOTE huhaosheng defined
-#define BOUNDARY_UPDATE_TIMEOUT 60ul
+#define BOUNDARY_UPDATE_TIMEOUT 60ul // seconds
 #define BOUNDARY_RATIO			0.5
 /** check whether the offset boundary is in the slide window
  * \return 	if it is boundary, return true
@@ -641,6 +642,8 @@ check_boundary(struct spdk_data_file_info *file_info, size_t index, uint64_t win
 	}
 }
 
+// NOTE huhaosheng defined
+#define MIN(x, y) x < y ? x : y
 // update offset boundary
 static uint64_t
 update_boundary(struct spdk_data_file_info *file_info) {
@@ -654,7 +657,7 @@ update_boundary(struct spdk_data_file_info *file_info) {
 	while(i <= (chunk_num - window_size) && !check_boundary(file_info, i, window_size)) {
 		++i;
 	}
-	boundary_off = min(boundary_off, (i + window_size >> 1) * CHUNK_SIZE);
+	boundary_off = MIN(boundary_off, (i + (window_size >> 1)) * CHUNK_SIZE);
 	return boundary_off;
 }
 
@@ -668,30 +671,27 @@ fs_boundary_update_fn(void *arg) {
 	struct spdk_filesystem * fs = arg;
 	fs->boundary_upd_loop = true;
 	struct timespec			ts;
-	uint64_t now, timeout;
+	struct timeval now;
 	int rc;
 
 	pthread_mutex_lock(&fs->boundary_upd_mtx);
 	while(fs->boundary_upd_loop) {
-		
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		now = spdk_get_ticks();
-		timeout = now + (BOUNDARY_UPDATE_TIMEOUT * spdk_get_ticks_hz()) / SPDK_SEC_TO_NSEC;
-
-		if (timeout > now) {
-			timeout = ((timeout - now) * SPDK_SEC_TO_NSEC) / spdk_get_ticks_hz() +
-				ts.tv_sec * SPDK_SEC_TO_NSEC + ts.tv_nsec;
-
-			ts.tv_sec  = timeout / SPDK_SEC_TO_NSEC;
-			ts.tv_nsec = timeout % SPDK_SEC_TO_NSEC;
+		if (gettimeofday(&now, NULL) < 0) {
+			printf("Cannot get current time\n");
+			break;
 		}
 		
+		ts.tv_nsec = (now.tv_usec * 1000) % 1000000000;
+		ts.tv_sec = now.tv_sec + BOUNDARY_UPDATE_TIMEOUT +
+				(now.tv_usec * 1000) / 1000000000;
+
 		rc = pthread_cond_timedwait((&fs->boundary_upd_cond), &fs->boundary_upd_mtx, &ts);
 		if (rc != ETIMEDOUT) {
 			break;
 		}
 		if(fs->boundary_upd_loop) {
 			/**  Do work */ 
+			printf("fs_boundary_update_fn do work once!\n");
 			struct spdk_data_file_info *file_info;
 			TAILQ_FOREACH(file_info, &fs->dFiles, link) {
 				// FIXME whether need lock
@@ -702,7 +702,7 @@ fs_boundary_update_fn(void *arg) {
 		}
 	}
 	pthread_mutex_unlock(&fs->boundary_upd_mtx);
-	
+	return NULL;
 }
 
 static struct spdk_filesystem *
@@ -723,10 +723,10 @@ fs_alloc(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn)
 	fs->g_vstream_id = 0;
 	TAILQ_INIT(&fs->dFiles);
 
-	pthread_mutex_init(&fs->boundary_upd_mtx, NULL);
-	pthread_cond_init(&fs->boundary_upd_cond, NULL);
-	pthread_create(&(fs->boundary_upd_thread_id), NULL, &fs_boundary_update_fn, (void*)fs);
-	fs->boundary_upd_tid_set = true;
+	// pthread_mutex_init(&fs->boundary_upd_mtx, NULL);
+	// pthread_cond_init(&fs->boundary_upd_cond, NULL);
+	// pthread_create(&(fs->boundary_upd_thread_id), NULL, &fs_boundary_update_fn, (void*)fs);
+	fs->boundary_upd_tid_set = false;
 	/** huhaosheng defiend end */
 
 	fs->bdev = dev;
@@ -850,14 +850,14 @@ file_alloc_ms(struct spdk_filesystem *fs, uint8_t file_type)
 	} else if(file_type == 2) {
 		// data file
 		struct spdk_data_file_info *file_info = calloc(1, sizeof(struct spdk_data_file_info));
+		file_info->file = file;
+		file->file_info = file_info;
 		pthread_spin_lock(&(fs->lock));
 		file_info->upper_vid = fs->g_vstream_id++;
 		file_info->lower_vid = fs->g_vstream_id++;
 		pthread_spin_unlock(&(fs->lock));
 		// FIXME whether dFiles need lock
 		TAILQ_INSERT_TAIL(&fs->dFiles, file_info, link);
-		file_info->file = file;
-		file->file_info = file_info;
 	} else {
 		// index file
 		struct spdk_index_file_info *file_info = calloc(1, sizeof(struct spdk_index_file_info));

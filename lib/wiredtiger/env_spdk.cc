@@ -328,10 +328,12 @@ int spdk_open_file(struct spdk_file_fd **fd, const char *name/*, int file_type*/
     if(strncmp(fname, "index", 5) == 0) {
         // index file
         file_type = 3;
-    } else if(strncmp(fname, "collection", 10) == 0) {
+    } else if(strncmp(fname, "collection", 10) == 0 || strcmp(fname, "ycsb_wiredtiger.wt") == 0) { 
+        // ycsb_wiredtiger.wt is wiredtiger data file in YCSB-C 
         // data file
         file_type = 2;
-    } else if(strncmp(fname, "WiredTigerLog", 13) == 0 || strncmp(fname, "WiredTigerPreplog", 17) == 0) {
+    } else if(strncmp(fname, "WiredTigerLog", 13) == 0 || strncmp(fname, "WiredTigerPreplog", 17) == 0 || 
+                strncmp(fname, "WiredTigerTmplog", 16) == 0) {
         // log file
         file_type = 1;
     } else {
