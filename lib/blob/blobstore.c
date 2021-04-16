@@ -2694,10 +2694,10 @@ blob_request_submit_op_split(struct spdk_io_channel *ch, struct spdk_blob *blob,
  *
  * \return  // the physical stream id
  */
-static void 
+static uint32_t
 blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_count, uint32_t vstream_id) {
 	struct spdk_cluster_stats *cluster_stats;
-	if(blob->bs->cluster_stats == NULL) return;
+	if(blob->bs->cluster_stats == NULL) return 0;
 	cluster_stats = blob->bs->cluster_stats;
 
 	uint32_t page_start = 0, page_end = 0;
@@ -2707,6 +2707,7 @@ blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_cou
 	uint64_t	io_units_per_cluster;
 	uint64_t	io_units_per_page;
 	uint64_t	page;
+	uint32_t 	pstream_id;
 
 	pages_per_cluster = blob->bs->pages_per_cluster;
 	shift = blob->bs->pages_per_cluster_shift;
@@ -2718,7 +2719,7 @@ blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_cou
 		io_units_per_cluster = io_units_per_page * pages_per_cluster;
 	}
 
-	int cluster_index = lba / io_units_per_cluster; // 	bs_lba_to_cluster
+	int cluster_index = lba / io_units_per_cluster;  // bs_lba_to_cluster
 
 	page = bs_io_unit_to_page(blob->bs, lba);
 	assert(page < blob->bs->total_clusters * pages_per_cluster);
@@ -2728,8 +2729,8 @@ blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_cou
 	assert(page < blob->bs->total_clusters * pages_per_cluster);
 	page_end = page % pages_per_cluster;
 
-	pthread_spin_lock(&(cluster_stats[cluster_index].lock));
 	uint64_t visit_add_nums = 0, evict_add_nums = 0;
+	pthread_mutex_lock(&(cluster_stats[cluster_index].lock));
 	for(uint32_t i = page_start; i <= page_end; i++) {
 		cluster_stats[cluster_index].visit_nums++;
 		visit_add_nums++;
@@ -2740,21 +2741,30 @@ blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_cou
 			spdk_bit_array_set(cluster_stats[cluster_index].pages, i);
 		}
 	}
+	pthread_mutex_unlock(&(cluster_stats[cluster_index].lock));
+
+	if(vstream_id > blob->bs->num_virtual_streams) {
+		printf("vstream_id : %u\n", vstream_id);
+		abort();
+	}
 	// NOTE: virtual stream mutex first , then physical stream mutex
-	pthread_spin_lock(&(blob->bs->virtual_streams[vstream_id].lock));
+	pthread_mutex_lock(&(blob->bs->virtual_streams[vstream_id].lock));
 	blob->bs->virtual_streams[vstream_id].total_visit_nums += visit_add_nums;
 	blob->bs->virtual_streams[vstream_id].total_evict_nums += evict_add_nums;
+	pstream_id = blob->bs->virtual_streams[vstream_id].physical_stream_id;
+	pthread_mutex_unlock(&(blob->bs->virtual_streams[vstream_id].lock));
 
 	// TODO : physical stream id == index or index+1
-	uint64_t pstream_id = blob->bs->virtual_streams[vstream_id].physical_stream_id;
-	pthread_spin_lock(&(blob->bs->physical_streams[pstream_id].lock));
+	if(pstream_id > blob->bs->num_physical_streams) {
+		printf("pstream_id : %u\n", pstream_id);
+		abort();
+	}
+	pthread_mutex_lock(&(blob->bs->physical_streams[pstream_id].lock));
 	blob->bs->physical_streams[pstream_id].total_visit_nums += visit_add_nums;
 	blob->bs->physical_streams[pstream_id].total_evict_nums += evict_add_nums;
-	pthread_spin_unlock(&(blob->bs->physical_streams[pstream_id].lock));
+	pthread_mutex_unlock(&(blob->bs->physical_streams[pstream_id].lock));
 
-	pthread_spin_unlock(&(blob->bs->virtual_streams[vstream_id].lock));
-
-	pthread_spin_unlock(&(cluster_stats[cluster_index].lock));
+	return pstream_id;
 }
 
 // NOTE denghejian define blob_request_submit_op_single_ms
@@ -2832,8 +2842,7 @@ blob_request_submit_op_single_ms(struct spdk_io_channel *_ch, struct spdk_blob *
 
 			if (op_type == SPDK_BLOB_WRITE) {
 				// NOTE : huhaosheng added
-				blob_update_cluster_stats(blob, lba, lba_count, vstream_id);
-				uint32_t pstream_id = blob_get_pstream_id(blob, vstream_id);
+				uint32_t pstream_id = blob_update_cluster_stats(blob, lba, lba_count, vstream_id);
 				// NOTE denghejian use bs_batch_write_dev_ms
 				bs_batch_write_dev_ms(batch, payload, lba, lba_count, pstream_id);
 			} else {
@@ -3402,19 +3411,19 @@ bs_dev_destroy(void *io_device)
 	if(bs->cluster_stats) {
 		for(uint64_t i = 0; i < bs->total_clusters; i++) {
 			spdk_bit_array_free(&(bs->cluster_stats[i].pages));
-			pthread_spin_destroy(&(bs->cluster_stats[i].lock));
+			pthread_mutex_destroy(&(bs->cluster_stats[i].lock));
 		}
 		free(bs->cluster_stats);
 	}
 	if(bs->virtual_streams) {
 		for(uint32_t i = 0; i < bs->num_virtual_streams; i++) {
-			pthread_spin_destroy(&(bs->virtual_streams[i].lock));
+			pthread_mutex_destroy(&(bs->virtual_streams[i].lock));
 		}
 		free(bs->virtual_streams);
 	}
 	if(bs->physical_streams) {
 		for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-			pthread_spin_destroy(&(bs->physical_streams[i].lock));
+			pthread_mutex_destroy(&(bs->physical_streams[i].lock));
 		}
 		free(bs->physical_streams);
 	}
@@ -3629,24 +3638,28 @@ bs_stream_update_fn(void *arg) {
 			printf("bs_stream_update_fn do work once!\n");
 			// FIRST: calculate and update every physical streams ratio (evict nums / visit nums)
 			for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-				pthread_spin_lock(&(bs->physical_streams[i].lock));
-				bs->physical_streams[i].ratio = (double)bs->physical_streams[i].total_evict_nums 
-											/ bs->physical_streams[i].total_visit_nums;
-				pthread_spin_unlock(&(bs->physical_streams[i].lock));
+				pthread_mutex_lock(&(bs->physical_streams[i].lock));
+				if(bs->physical_streams[i].total_visit_nums != 0)
+					bs->physical_streams[i].ratio = (double)bs->physical_streams[i].total_evict_nums 
+												/ bs->physical_streams[i].total_visit_nums;
+				pthread_mutex_unlock(&(bs->physical_streams[i].lock));
 			}
 			// SECOND: re-calculate every virtual streams ratio and find the physical stream 
 			// whose ratio has minimum difference (min diff), 
 			// then change the physical stream mapped by virtual stream if needed
 			double ratio, min_diff, diff;
 			uint32_t new_pstream_id, old_pstream_id;
+			uint64_t total_visit_nums, total_evict_nums;
 			for(uint32_t i = 0; i < bs->num_virtual_streams; i++) {
 				// NOTE:  physical no lock cuz ratio only modify in this fn before
-				pthread_spin_lock(&(bs->virtual_streams[i].lock));
-				// calculate virtual streams[i] ratio
-				ratio = (double)bs->virtual_streams[i].total_evict_nums \
-					/ bs->virtual_streams[i].total_visit_nums;
-				// TODO : physical stream id == index or index + 1, here is id == index
+				pthread_mutex_lock(&(bs->virtual_streams[i].lock));
+				total_visit_nums = bs->virtual_streams[i].total_evict_nums;
+				total_evict_nums = bs->virtual_streams[i].total_visit_nums;
 				old_pstream_id = bs->virtual_streams[i].physical_stream_id;
+				pthread_mutex_unlock(&(bs->virtual_streams[i].lock));
+				// calculate virtual streams[i] ratio
+				ratio = (double)total_evict_nums / total_visit_nums;
+				// TODO : physical stream id == index or index + 1, here is id == index
 				new_pstream_id = old_pstream_id;
 				// calculate the ratio diff between the virtual stream and now physical stream 
 				// as min diff
@@ -3655,7 +3668,7 @@ bs_stream_update_fn(void *arg) {
 					bs->physical_streams[old_pstream_id].ratio - ratio;
 				// calculate all the ratio diff with all optional physical streams (except fixed 0,1,2)
 				for(uint32_t j = 0; j < bs->num_physical_streams; j++) {
-					if(j != bs->virtual_streams[i].physical_stream_id) {
+					if(j != old_pstream_id) {
 						// calculate the ratio diff between the virtual stream and the physical stream 
 						diff = ratio > bs->physical_streams[j].ratio ? \
 							ratio - bs->physical_streams[j].ratio : \
@@ -3666,19 +3679,27 @@ bs_stream_update_fn(void *arg) {
 						}
 					}
 				}
+
 				if(new_pstream_id != old_pstream_id) {
 					// if the map relationship changed, update the old physical stream's info
-					pthread_spin_lock(&(bs->physical_streams[old_pstream_id].lock));
-					bs->physical_streams[old_pstream_id].total_visit_nums -= bs->virtual_streams[i].total_visit_nums;
-					bs->physical_streams[old_pstream_id].total_evict_nums -= bs->virtual_streams[i].total_evict_nums;
-					pthread_spin_unlock(&(bs->physical_streams[old_pstream_id].lock));
+					pthread_mutex_lock(&(bs->physical_streams[old_pstream_id].lock));
+					if(bs->physical_streams[old_pstream_id].total_visit_nums > total_visit_nums){
+						bs->physical_streams[old_pstream_id].total_visit_nums -= total_visit_nums;
+					} else {
+						bs->physical_streams[old_pstream_id].total_visit_nums = 0;
+					}
+					if(bs->physical_streams[old_pstream_id].total_evict_nums > total_evict_nums){
+						bs->physical_streams[old_pstream_id].total_evict_nums -= total_evict_nums;
+					} else {
+						bs->physical_streams[old_pstream_id].total_evict_nums = 0;
+					}
+					pthread_mutex_unlock(&(bs->physical_streams[old_pstream_id].lock));
 					// if the map relationship changed, update the new physical stream's info
-					pthread_spin_lock(&(bs->physical_streams[new_pstream_id].lock));
-					bs->physical_streams[new_pstream_id].total_visit_nums += bs->virtual_streams[i].total_visit_nums;
-					bs->physical_streams[new_pstream_id].total_evict_nums += bs->virtual_streams[i].total_evict_nums;
-					pthread_spin_unlock(&(bs->physical_streams[new_pstream_id].lock));
+					pthread_mutex_lock(&(bs->physical_streams[new_pstream_id].lock));
+					bs->physical_streams[new_pstream_id].total_visit_nums += total_visit_nums;
+					bs->physical_streams[new_pstream_id].total_evict_nums += total_evict_nums;
+					pthread_mutex_unlock(&(bs->physical_streams[new_pstream_id].lock));
 				}
-				pthread_spin_unlock(&(bs->virtual_streams[i].lock));
 			}
 		}
 	}
@@ -3799,7 +3820,7 @@ bs_alloc_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob
 	bs->cluster_stats = calloc(bs->total_clusters, sizeof(struct spdk_cluster_stats));
 	for(uint64_t i = 0; i < bs->total_clusters; i++) {
 		bs->cluster_stats[i].pages = spdk_bit_array_create(bs->pages_per_cluster);
-		pthread_spin_init(&(bs->cluster_stats[i].lock), 0);
+		pthread_mutex_init(&(bs->cluster_stats[i].lock), NULL);
 	}
 	bs->num_virtual_streams = opts->num_virtual_streams;
 	bs->num_physical_streams = opts->num_physical_streams;
@@ -3807,15 +3828,16 @@ bs_alloc_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob
 
 	// NOTE : init virtual stream and physical stream map relationship
 	// TODO : physical stream id == index or index+1, here is id == index
-	for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-		pthread_spin_init(&(bs->virtual_streams[i].lock), 0);
+	uint32_t i = 0;
+	for(; i < bs->num_physical_streams; i++) {
+		pthread_mutex_init(&(bs->virtual_streams[i].lock), NULL);
 		// //seq init map relationship 
 		/** TODO may do not need init map relationship */
 		bs->virtual_streams[i].physical_stream_id = i;
 	}
 	srand(time(NULL));
-	for(uint32_t i = bs->num_physical_streams; i < bs->num_virtual_streams; i++) {
-		pthread_spin_init(&(bs->virtual_streams[i].lock), 0);
+	for(; i < bs->num_virtual_streams; i++) {
+		pthread_mutex_init(&(bs->virtual_streams[i].lock), NULL);
 		// // TODO : how many physical stream ids are fixed, here is 3
 		// random init the rest of map relationship
 		// bs->virtual_streams[i].physical_stream_id = rand() % (bs->num_physical_streams - 3) + 3;
@@ -3824,15 +3846,15 @@ bs_alloc_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob
 	}
 
 	bs->physical_streams = calloc(bs->num_physical_streams, sizeof(struct spdk_physical_stream_info));
-	for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-		pthread_spin_init(&(bs->physical_streams[i].lock), 0);
+	for(i = 0; i < bs->num_physical_streams; i++) {
+		pthread_mutex_init(&(bs->physical_streams[i].lock), NULL);
 	}
 
 	// NOTE init backgroud stream update thread
-	// pthread_mutex_init(&bs->stream_upd_mtx, NULL);
-	// pthread_cond_init(&bs->stream_upd_cond, NULL);
-	// pthread_create(&(bs->stream_upd_thread_id), NULL, &bs_stream_update_fn, (void*)bs);
-	bs->stream_upd_tid_set = false;
+	pthread_mutex_init(&bs->stream_upd_mtx, NULL);
+	pthread_cond_init(&bs->stream_upd_cond, NULL);
+	pthread_create(&(bs->stream_upd_thread_id), NULL, &bs_stream_update_fn, (void*)bs);
+	bs->stream_upd_tid_set = true;
 	/* NOTE huhaosheng add end */
 
 	/* The metadata is assumed to be at least 1 page */
@@ -3868,17 +3890,17 @@ bs_alloc_ms(struct spdk_bs_dev *dev, struct spdk_bs_opts *opts, struct spdk_blob
 		// free cluster stats
 		for(uint64_t i = 0; i < bs->total_clusters; i++) {
 			spdk_bit_array_free(&(bs->cluster_stats[i].pages));
-			pthread_spin_destroy(&(bs->cluster_stats[i].lock));
+			pthread_mutex_destroy(&(bs->cluster_stats[i].lock));
 		}
 		free(bs->cluster_stats);
 		// free virtual streams info
 		for(uint32_t i = 0; i < bs->num_virtual_streams; i++) {
-			pthread_spin_destroy(&(bs->virtual_streams[i].lock));
+			pthread_mutex_destroy(&(bs->virtual_streams[i].lock));
 		}
 		free(bs->virtual_streams);
 		// free physical streams info
 		for(uint32_t i = 0; i < bs->num_physical_streams; i++) {
-			pthread_spin_destroy(&(bs->physical_streams[i].lock));
+			pthread_mutex_destroy(&(bs->physical_streams[i].lock));
 		}
 		free(bs->physical_streams);
 		/* NOTE huhaosheng add end */

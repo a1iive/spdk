@@ -1,5 +1,5 @@
-#include "core/env.h" // for YCSB-C
-// #include "mongo/db/storage/wiredtiger/wiredtiger_env.h"  // for mongodb
+// #include "core/env.h" // for YCSB-C
+#include "mongo/db/storage/wiredtiger/wiredtiger_env.h"  // for mongodb
 
 extern "C" {
     #include "spdk/env.h"
@@ -14,8 +14,8 @@ extern "C" {
     #include "spdk_internal/thread.h"
 }
 
-namespace ycsbc // for YCSB-C
-// namespace mongo // for mongodb
+// namespace ycsbc // for YCSB-C
+namespace mongo // for mongodb
 {
 
 struct spdk_filesystem *g_wt_fs = NULL;
@@ -255,8 +255,9 @@ int spdk_fs_directory_list(const char *directory,
 	while(iter != NULL) {
         file = spdk_fs_iter_get_file(iter);
         name = spdk_file_get_name(file);
+        const char* fname = basename(name);
         if (strncmp(name, directory, len) != 0 ||
-          (prefix != NULL && strncmp(name, prefix, prefix_len) != 0)){
+          (prefix != NULL && strncmp(fname, prefix, prefix_len) != 0)){
               iter = spdk_fs_iter_next(iter);
               continue;
           }

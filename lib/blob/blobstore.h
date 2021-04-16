@@ -55,7 +55,7 @@
 /** NOTE huhaosheng declared */
 #define SPDK_NUM_VIRTUAL_STREAMS 	256      // num of virtual streams
 #define SPDK_NUM_PHYSICAL_STREAMS	32       // num of physical streams
-#define SPDK_STREAM_UPDATE_TIMEOUT	60ul 	 // stream states update timeout (s)
+#define SPDK_STREAM_UPDATE_TIMEOUT	30ul 	 // stream states update timeout (s)
 
 struct spdk_xattr {
 	uint32_t	index;
@@ -186,25 +186,23 @@ struct spdk_virtual_stream_info
 	uint32_t physical_stream_id;
 	uint64_t total_visit_nums;
 	uint64_t total_evict_nums;
-	pthread_spinlock_t	 lock; // NOTE : pthread_mutex_t change to pthread_spinlock_t
+	pthread_mutex_t	 lock; // NOTE : pthread_mutex_t change to pthread_spinlock_t
 };
 struct spdk_physical_stream_info
 {
 	uint64_t total_visit_nums;
 	uint64_t total_evict_nums;
 	double ratio;
-	pthread_spinlock_t	 lock;
+	pthread_mutex_t	 lock;
 };
 
 // NOTE: huhaosheng declared
 struct spdk_cluster_stats {
 	uint64_t visit_nums;
 	uint64_t evict_nums;
-	pthread_spinlock_t	 lock;
-	/* if pages per cluster == n , bitmap bits = n/8 */
-	/* page id = x, pages per cluster = n: (bits[x % n / 8] >> (x % n) % 8) & 0x01 */
-	// char bits[]; 
-	/* page id = x, pages per cluster = n: spdk_bit_array_get(pages, x % n) */
+	pthread_mutex_t	 lock;
+	/* if block per cluster == n , bitmap bits = n/8 */
+	/* block(io_unit) id = x, block(io_unit) per cluster = n: spdk_bit_array_get(blocks, x % n) */
 	struct spdk_bit_array	*pages;
 };
 
@@ -760,9 +758,9 @@ blob_get_pstream_id(struct spdk_blob *blob, uint32_t vstream_id) {
 	// TODO : failure
 	assert(vstream_id < blob->bs->num_virtual_streams);
 
-	pthread_spin_lock(&(blob->bs->virtual_streams[vstream_id].lock));
+	pthread_mutex_lock(&(blob->bs->virtual_streams[vstream_id].lock));
 	pstream_id = blob->bs->virtual_streams[vstream_id].physical_stream_id;
-	pthread_spin_unlock(&(blob->bs->virtual_streams[vstream_id].lock));
+	pthread_mutex_unlock(&(blob->bs->virtual_streams[vstream_id].lock));
 
 	return pstream_id;
 }

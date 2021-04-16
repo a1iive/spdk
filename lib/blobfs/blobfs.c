@@ -156,8 +156,8 @@ struct spdk_deleted_file {
 };
 
 // NOTE huhaosheng declared 
-#define CHUNK_SIZE 		1024 * 1024  /** partition file by chunk size */
-#define MAX_CHUNK_NUM 	10ul * 1024   
+#define CHUNK_SIZE 		(1024 * 1024)  /** partition file by chunk size */ // FIXME fatal bug. add ()
+#define MAX_CHUNK_NUM 	(10ul * 1024)   
 #define WINDOW_RATIO	10
 #define INDEX_VSTREAM_NUM 	4
 
@@ -180,6 +180,7 @@ struct spdk_data_file_info {
 	uint32_t upper_vid;  /** upper half offset vstream id */
 	uint32_t lower_vid;  /** lower half offset vstream id */
 	uint64_t boundary_offset;  /** dividing line of the whole offset space  */
+	pthread_mutex_t	lock;
 	struct spdk_file *file;
 	/** chunk visit nums */
 	uint32_t chunk_visit_count[MAX_CHUNK_NUM];
@@ -202,7 +203,7 @@ struct spdk_filesystem {
 	fs_send_request_fn	send_request;
 
 	/** NOTE huhaosheng declared start */
-	pthread_spinlock_t 				lock;			/** lock for g_vstream_id */
+	pthread_mutex_t					lock;			/** lock for g_vstream_id */
 	uint32_t						g_vstream_id; 	/** global vstream id */
 	// TAILQ_HEAD(, spdk_metadata_file_info) 	mdFiles;
 	// TAILQ_HEAD(, spdk_log_file_info) 		logFiles;
@@ -618,7 +619,7 @@ init_cb(void *ctx, struct spdk_blob_store *bs, int bserrno)
 }
 
 // NOTE huhaosheng defined
-#define BOUNDARY_UPDATE_TIMEOUT 60ul // seconds
+#define BOUNDARY_UPDATE_TIMEOUT 30ul // seconds
 #define BOUNDARY_RATIO			0.5
 /** check whether the offset boundary is in the slide window
  * \return 	if it is boundary, return true
@@ -643,16 +644,20 @@ check_boundary(struct spdk_data_file_info *file_info, size_t index, uint64_t win
 }
 
 // NOTE huhaosheng defined
-#define MIN(x, y) x < y ? x : y
+#define MIN(x, y) (x < y ? x : y)
+#define MAX(x, y) (x > y ? x : y)
 // update offset boundary
 static uint64_t
 update_boundary(struct spdk_data_file_info *file_info) {
 	uint64_t chunk_num = file_info->file->length / CHUNK_SIZE;
-	uint64_t window_size = chunk_num / WINDOW_RATIO;
+	// at least 2 chunk so that window can be 2 chunk
+	if(chunk_num < 2) return file_info->file->length;
+	// window size at least 2 chunk 
+	uint64_t window_size = MAX(2, chunk_num / WINDOW_RATIO);
 	uint64_t boundary_off = file_info->file->length;
 	size_t i = 0;
 	while(i <= (chunk_num - window_size) && !check_boundary(file_info, i, window_size)) {
-		i = i + (window_size >> 1);
+		i = i + MAX((window_size >> 1), 1);
 	}
 	while(i <= (chunk_num - window_size) && !check_boundary(file_info, i, window_size)) {
 		++i;
@@ -695,9 +700,9 @@ fs_boundary_update_fn(void *arg) {
 			struct spdk_data_file_info *file_info;
 			TAILQ_FOREACH(file_info, &fs->dFiles, link) {
 				// FIXME whether need lock
-				pthread_spin_lock(&file_info->file->lock);
+				// pthread_mutex_lock(&file_info->lock);
 				file_info->boundary_offset = update_boundary(file_info);
-				pthread_spin_unlock(&file_info->file->lock);
+				// pthread_mutex_unlock(&file_info->lock);
 			}
 		}
 	}
@@ -716,17 +721,14 @@ fs_alloc(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn)
 	}
 
 	/** NOTE huhaosheng defined start */
-	if(pthread_spin_init(&fs->lock, 0)) {
-		free(fs);
-		return NULL;
-	}
+	pthread_mutex_init(&fs->lock, NULL);
 	fs->g_vstream_id = 0;
 	TAILQ_INIT(&fs->dFiles);
 
-	// pthread_mutex_init(&fs->boundary_upd_mtx, NULL);
-	// pthread_cond_init(&fs->boundary_upd_cond, NULL);
-	// pthread_create(&(fs->boundary_upd_thread_id), NULL, &fs_boundary_update_fn, (void*)fs);
-	fs->boundary_upd_tid_set = false;
+	pthread_mutex_init(&fs->boundary_upd_mtx, NULL);
+	pthread_cond_init(&fs->boundary_upd_cond, NULL);
+	pthread_create(&(fs->boundary_upd_thread_id), NULL, &fs_boundary_update_fn, (void*)fs);
+	fs->boundary_upd_tid_set = true;
 	/** huhaosheng defiend end */
 
 	fs->bdev = dev;
@@ -836,38 +838,40 @@ file_alloc_ms(struct spdk_filesystem *fs, uint8_t file_type)
 	if(file_type == 0) {
 		// matadata file
 		struct spdk_metadata_file_info *file_info = calloc(1, sizeof(struct spdk_metadata_file_info));
-		pthread_spin_lock(&(fs->lock));
+		pthread_mutex_lock(&(fs->lock));
 		file_info->vstream_id = fs->g_vstream_id++;
-		pthread_spin_unlock(&(fs->lock));
+		pthread_mutex_unlock(&(fs->lock));
 		file->file_info = file_info;
 	} else if(file_type == 1) {
 		// log file
 		struct spdk_log_file_info *file_info = calloc(1, sizeof(struct spdk_log_file_info));
-		pthread_spin_lock(&(fs->lock));
+		pthread_mutex_lock(&(fs->lock));
 		file_info->vstream_id = fs->g_vstream_id++;
-		pthread_spin_unlock(&(fs->lock));
+		pthread_mutex_unlock(&(fs->lock));
 		file->file_info = file_info;
 	} else if(file_type == 2) {
 		// data file
 		struct spdk_data_file_info *file_info = calloc(1, sizeof(struct spdk_data_file_info));
+		pthread_mutex_init(&file_info->lock, NULL);
 		file_info->file = file;
 		file->file_info = file_info;
-		pthread_spin_lock(&(fs->lock));
+		pthread_mutex_lock(&(fs->lock));
 		file_info->upper_vid = fs->g_vstream_id++;
 		file_info->lower_vid = fs->g_vstream_id++;
-		pthread_spin_unlock(&(fs->lock));
+		pthread_mutex_unlock(&(fs->lock));
 		// FIXME whether dFiles need lock
 		TAILQ_INSERT_TAIL(&fs->dFiles, file_info, link);
 	} else {
 		// index file
 		struct spdk_index_file_info *file_info = calloc(1, sizeof(struct spdk_index_file_info));
-		pthread_spin_lock(&(fs->lock));
+		pthread_mutex_lock(&(fs->lock));
 		// TODO 
 		file_info->start_vid = fs->g_vstream_id;
 		fs->g_vstream_id += INDEX_VSTREAM_NUM;
-		pthread_spin_unlock(&(fs->lock));
+		pthread_mutex_unlock(&(fs->lock));
 		file->file_info = file_info;
 	}
+	printf("file_alloc_ms: g_vstream_id = %u\n", fs->g_vstream_id);
 	return file;
 }
 
@@ -1137,9 +1141,10 @@ unload_cb(void *ctx, int bserrno)
 	struct spdk_data_file_info *file_info, *tmp_info;
 
 	TAILQ_FOREACH_SAFE(file_info, &fs->dFiles, link, tmp_info) {
+		pthread_mutex_destroy(&file_info->lock);
 		TAILQ_REMOVE(&fs->dFiles, file_info, link);
 	}
-	pthread_spin_destroy(&fs->lock);
+	pthread_mutex_destroy(&fs->lock);
 
 	/** huhaosheng defined end */
 	TAILQ_FOREACH_SAFE(file, &fs->files, tailq, tmp) {
@@ -1352,7 +1357,9 @@ spdk_fs_create_file_async_ms(struct spdk_filesystem *fs, const char *name, uint8
 		cb_fn(cb_arg, -EEXIST);
 		return;
 	}
-
+	
+	printf("spdk_fs_create_file_async_ms : name = %s\n", name);
+	
 	file = file_alloc_ms(fs, file_type);
 	if (file == NULL) {
 		SPDK_ERRLOG("Cannot allocate new file for creation\n");
@@ -1912,8 +1919,13 @@ spdk_fs_delete_file_async(struct spdk_filesystem *fs, const char *name,
 	TAILQ_REMOVE(&fs->files, f, tailq);
 	
 	// NOTE huhaosheng defined
-	struct spdk_data_file_info *file_info = (struct spdk_data_file_info *)f->file_info;
-	if(f->file_type == 3 && file_info) TAILQ_REMOVE(&fs->dFiles, file_info, link);
+	if(f->file_info != NULL) {
+		if(f->file_type == 2) {
+			struct spdk_data_file_info *file_info = (struct spdk_data_file_info *)f->file_info;
+			pthread_mutex_destroy(&file_info->lock);
+			TAILQ_REMOVE(&fs->dFiles, file_info, link);
+		}
+	}
 
 	file_free(f);
 
@@ -3085,6 +3097,10 @@ spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		size_t index = offset / CHUNK_SIZE;
 		size_t nums = length / CHUNK_SIZE;
 		struct spdk_data_file_info *file_info = (struct spdk_data_file_info*)file->file_info;
+		if(index + nums > MAX_CHUNK_NUM) {
+			printf("spdk_file_write_ms : index + nums = %lu\n", index + nums);
+			abort();
+		}
 		pthread_spin_lock(&file->lock);
 		for(size_t i = 0; i < nums; i++) {
 			file_info->chunk_visit_count[index+i]++;
