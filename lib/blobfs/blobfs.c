@@ -1234,6 +1234,8 @@ spdk_fs_open_file_async(struct spdk_filesystem *fs, const char *name, uint32_t f
 		return;
 	}
 
+	printf("spdk_fs_open_file_async : name = %s\n", name);
+	
 	if (f != NULL && f->is_deleted == true) {
 		cb_fn(cb_arg, NULL, -ENOENT);
 		return;

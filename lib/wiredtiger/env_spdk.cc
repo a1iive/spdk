@@ -255,17 +255,12 @@ int spdk_fs_directory_list(const char *directory,
 	while(iter != NULL) {
         file = spdk_fs_iter_get_file(iter);
         name = spdk_file_get_name(file);
+        const char* fname = basename(name);
         if (strncmp(name, directory, len) != 0 ||
-          (prefix != NULL && strncmp(name, prefix, prefix_len) != 0)){
+          (prefix != NULL && strncmp(fname, prefix, prefix_len) != 0)){
               iter = spdk_fs_iter_next(iter);
               continue;
           }
-
-        // if (strncmp(name, directory, len) != 0) {
-        //     spdk_fs_iter_next(iter);
-        //     continue;
-        // }
-            
 
         /*
          * Increase the list size in groups of 10, it doesn't matter if the list is a bit longer
@@ -312,8 +307,7 @@ int spdk_fs_directory_list_free(char **dirlist, uint32_t count)
     return (0);
 }
 
-int spdk_open_file(struct spdk_file_fd **fd, const char *name,
-  int file_type)
+int spdk_open_file(struct spdk_file_fd **fd, const char *name)
 {
     // char *path;
     struct spdk_file *file;
@@ -324,14 +318,16 @@ int spdk_open_file(struct spdk_file_fd **fd, const char *name,
     // TODO : 是否所有name传参都可能是文件名，还是都是绝对路径
     // WT_RET(__wt_filename(session, name, &path));
     set_channel();
-    if (file_type == 0){
-        rc = spdk_fs_open_file(g_wt_fs, g_wt_sync_args.channel,
-                        name, 0, &file);
-    }
-    else {
-        rc = spdk_fs_open_file(g_wt_fs, g_wt_sync_args.channel,
+    // if (file_type == 0){
+    //     rc = spdk_fs_open_file(g_wt_fs, g_wt_sync_args.channel,
+    //                     name, 0, &file);
+    // }
+    // else {
+    //     rc = spdk_fs_open_file(g_wt_fs, g_wt_sync_args.channel,
+    //                     name, SPDK_BLOBFS_OPEN_CREATE, &file);
+    // }
+    rc = spdk_fs_open_file(g_wt_fs, g_wt_sync_args.channel,
                         name, SPDK_BLOBFS_OPEN_CREATE, &file);
-    }
     if(rc == 0) {
         // TODO : file need save in someplace
         (*fd)->mFile = file;
