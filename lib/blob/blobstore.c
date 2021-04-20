@@ -2493,7 +2493,9 @@ struct op_split_ctx {
 	void *curr_payload;
 	enum spdk_blob_op_type op_type;
 	spdk_bs_sequence_t *seq;
-	uint32_t vstream_id;
+	/** NOTE huhaosheng declared */
+	uint8_t file_type;
+	void	*file_info;
 };
 
 static void
@@ -2584,7 +2586,7 @@ blob_request_submit_op_split_next_ms(void *cb_arg, int bserrno)
 				  blob_request_submit_op_split_next, ctx);
 		break;
 	case SPDK_BLOB_WRITE:
-		spdk_blob_io_write_ms(blob, ch, buf, offset, op_length, ctx->vstream_id,
+		spdk_blob_io_write_ms(blob, ch, buf, offset, op_length, ctx->file_type, ctx->file_info,
 				   blob_request_submit_op_split_next_ms, ctx);
 		break;
 	case SPDK_BLOB_UNMAP:
@@ -2607,7 +2609,7 @@ blob_request_submit_op_split_next_ms(void *cb_arg, int bserrno)
 // NOTE huhaosheng define 
 static void
 blob_request_submit_op_split_ms(struct spdk_io_channel *ch, struct spdk_blob *blob,
-			     void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+			     void *payload, uint64_t offset, uint64_t length, uint8_t file_type, void *file_info,
 			     spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type)
 {
 	struct op_split_ctx *ctx;
@@ -2640,7 +2642,9 @@ blob_request_submit_op_split_ms(struct spdk_io_channel *ch, struct spdk_blob *bl
 	ctx->io_units_remaining = length;
 	ctx->op_type = op_type;
 	ctx->seq = seq;
-	ctx->vstream_id = vstream_id;
+	// NOTE huhaosheng defined
+	ctx->file_type = file_type;
+	ctx->file_info = file_info;
 
 	blob_request_submit_op_split_next_ms(ctx, 0);
 }
@@ -2719,7 +2723,7 @@ blob_update_cluster_stats(struct spdk_blob *blob, uint64_t lba, uint32_t lba_cou
 		io_units_per_cluster = io_units_per_page * pages_per_cluster;
 	}
 
-	int cluster_index = lba / io_units_per_cluster;  // bs_lba_to_cluster
+	uint64_t cluster_index = lba / io_units_per_cluster;  // bs_lba_to_cluster
 
 	page = bs_io_unit_to_page(blob->bs, lba);
 	assert(page < blob->bs->total_clusters * pages_per_cluster);
@@ -3005,10 +3009,102 @@ blob_request_submit_op_single(struct spdk_io_channel *_ch, struct spdk_blob *blo
 	}
 }
 
+// NOTE huhaosheng defined
+static double
+__pow_double(double x, uint64_t n) {
+	double res = 1;
+	while(n--) {
+		res *= x;
+	}
+	return res;
+}
+
+// NOTE huhaosheng defined
+/**
+ * AutoStream
+ * calculate the index file chunk's vstream id. and update index file info
+ * \param	index means lba to cluster index (bs_lba_to_cluster)
+ * \return 	vstream id
+ */
+static uint32_t
+calculate_chunk_vid(struct spdk_blob_store *bs, struct spdk_index_file_info *file_info, 
+				uint64_t index) 
+{
+	if(index > MAX_CHUNK_NUM) {
+		printf("blob_calculate_chunk_vid : index = %lu\n", index);
+		abort();
+	}
+	struct chunk2vstream_table *table = file_info->table;
+	uint32_t vstream_id = file_info->start_vid;
+	uint64_t now = spdk_get_ticks();
+	pthread_mutex_lock(&file_info->lock);
+	table->visit_count[index]++;
+	table->score[index]++;
+	if(table->score[index] > table->score_hottest) {
+		table->score_hottest = table->score[index];
+		table->period = (now - table->restart_time) / table->visit_count[index];
+		table->visit_time[index] = now;
+		vstream_id = file_info->start_vid + INDEX_VSTREAM_NUM - 1;
+	} else {
+		uint64_t revisit_interval = now - table->visit_time[index];
+		table->visit_time[index] = now;
+		table->score[index] = table->score[index] * __pow_double((double)3/4, revisit_interval / table->period);
+		uint32_t dis = ((double)table->score[index] / table->score_hottest) * INDEX_VSTREAM_NUM;
+		vstream_id = file_info->start_vid + dis;
+	}
+	pthread_mutex_unlock(&file_info->lock);
+	return vstream_id;
+}
+
+/**
+ * NOTE huhaosheng defined
+ * get the vstream id of different file_info
+ * \param	index means lba to cluster index (bs_lba_to_cluster)
+ * \param 	offset means lba
+ * \return 	vstream id
+ */
+static uint32_t 
+get_vstream_id(struct spdk_blob_store *bs, void *file_info, uint8_t file_type,
+				uint64_t index, uint64_t offset) 
+{
+	uint32_t vstream_id = 0;
+	if(index > MAX_CHUNK_NUM) {
+		printf("get_vstream_id : index = %lu\n", index);
+		abort();
+	}
+	// FIXME fatal bug. change file_info to tmp. can't use the same label(v name).
+	if(file_type == 0) {
+		// metadata file
+		struct spdk_metadata_file_info *tmp = (struct spdk_metadata_file_info *)file_info;
+		vstream_id = tmp->vstream_id;
+	} else if(file_type == 1) {
+		// log file
+		struct spdk_log_file_info *tmp = (struct spdk_log_file_info *)file_info;
+		vstream_id = tmp->vstream_id;
+	} 
+	else if(file_type == 2) {
+		// data file
+		struct spdk_data_file_info *tmp = (struct spdk_data_file_info *)file_info;
+		uint64_t boundary_lba = tmp->boundary_offset / spdk_bs_get_io_unit_size(bs);
+		// update file info // WARN maybe write failed
+		pthread_mutex_lock(&tmp->lock);
+		if(offset > boundary_lba) vstream_id = tmp->upper_vid;
+		else vstream_id = tmp->lower_vid;
+		tmp->chunk_visit_count[index]++;
+		pthread_mutex_unlock(&tmp->lock);
+	}
+	else {
+		// index file
+		struct spdk_index_file_info *tmp = (struct spdk_index_file_info *)file_info;
+		vstream_id = calculate_chunk_vid(bs, tmp, index);
+	}
+	return vstream_id;
+}
+
 // NOTE denghejian define blob_request_submit_op_ms
 static void
 blob_request_submit_op_ms(struct spdk_blob *blob, struct spdk_io_channel *_channel,
-		       void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+		       void *payload, uint64_t offset, uint64_t length, uint8_t file_type, void *file_info,
 		       spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type)
 {
 	assert(blob != NULL);
@@ -3023,13 +3119,16 @@ blob_request_submit_op_ms(struct spdk_blob *blob, struct spdk_io_channel *_chann
 		return;
 	}
 	if (length <= bs_num_io_units_to_cluster_boundary(blob, offset)) {
+		// NOTE huhaosheng defined 
+		uint64_t index = bs_lba_to_cluster(blob->bs, offset);
+		uint32_t vstream_id = get_vstream_id(blob->bs, file_info, file_type, index, offset);
 		// NOTE denghejian use blob_request_submit_op_single_ms
 		blob_request_submit_op_single_ms(_channel, blob, payload, offset, length, vstream_id,
 					      cb_fn, cb_arg, op_type);
 	} else {
 		// NOTE huhaosheng changed
 		// finally invoke blob_request_submit_op_ms
-		blob_request_submit_op_split_ms(_channel, blob, payload, offset, length, vstream_id, 
+		blob_request_submit_op_split_ms(_channel, blob, payload, offset, length, file_type, file_info, 
 					     cb_fn, cb_arg, op_type);
 	}
 }
@@ -8190,11 +8289,11 @@ void spdk_blob_io_write_zeroes(struct spdk_blob *blob, struct spdk_io_channel *c
 
 // NOTE huhaosheng defined
 void spdk_blob_io_write_ms(struct spdk_blob *blob, struct spdk_io_channel *channel,
-			void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+			void *payload, uint64_t offset, uint64_t length, uint8_t file_type, void *file_info,
 			spdk_blob_op_complete cb_fn, void *cb_arg)
 {
 	// NOTE huhaosheng changed
-	blob_request_submit_op_ms(blob, channel, payload, offset, length, vstream_id, cb_fn, cb_arg,
+	blob_request_submit_op_ms(blob, channel, payload, offset, length, file_type, file_info, cb_fn, cb_arg,
 			       SPDK_BLOB_WRITE);
 }
 

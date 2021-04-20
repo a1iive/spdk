@@ -457,12 +457,12 @@ int64_t spdk_read_file(struct spdk_file_fd *fd, off_t offset, size_t len, void *
     return rc;
 }
 
-int spdk_write_file(struct spdk_file_fd *fd, off_t offset, size_t len, void *buf)
+int spdk_write_file(struct spdk_file_fd *fd, off_t offset, size_t len, void *buf, bool checkpoint)
 {
     int64_t rc;
 
 	set_channel();
-	rc = spdk_file_write_ms((struct spdk_file *)fd->mFile, g_wt_sync_args.channel, buf, offset, len);
+	rc = spdk_file_write_ms((struct spdk_file *)fd->mFile, g_wt_sync_args.channel, buf, offset, len, checkpoint);
     
 	return rc;
 }

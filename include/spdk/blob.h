@@ -61,6 +61,7 @@
 #define SPDK_BLOB_H
 
 #include "spdk/stdinc.h"
+#include "spdk/queue.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,6 +88,67 @@ struct spdk_blob_store;
 struct spdk_io_channel;
 struct spdk_blob;
 struct spdk_xattr_names;
+// NOTE huhaosheng declared
+struct chunk2vstream_table;
+struct spdk_metadata_file_info;
+struct spdk_log_file_info;
+struct spdk_data_file_info;
+struct spdk_index_file_info;
+// NOTE huhaosheng declared 
+#define CHUNK_SIZE 		(1024 * 1024)  /** partition file by chunk size */ // FIXME fatal bug. add ()
+#define MAX_CHUNK_NUM 	(10ul * 1024)   
+#define WINDOW_RATIO	10
+#define INDEX_VSTREAM_NUM 	4
+
+/** NOTE huhaosheng defined start */
+// NOTE huhaosheng defined
+struct spdk_metadata_file_info {
+	uint32_t vstream_id;
+	// struct spdk_file *file;
+	TAILQ_ENTRY(spdk_metadata_file_info) link;
+};
+
+// NOTE huhaosheng defined
+struct spdk_log_file_info {
+	uint32_t vstream_id;
+	// struct spdk_file *file;
+	TAILQ_ENTRY(spdk_log_file_info) link;
+};
+
+// NOTE huhaosheng defined
+struct spdk_data_file_info {
+	uint32_t upper_vid;  /** upper half offset vstream id */
+	uint32_t lower_vid;  /** lower half offset vstream id */
+	uint64_t boundary_offset;  /** dividing line of the whole offset space  */
+	pthread_mutex_t	lock;
+	struct spdk_file *file;
+	/** chunk visit nums */
+	uint32_t chunk_visit_count[MAX_CHUNK_NUM];
+	TAILQ_ENTRY(spdk_data_file_info) link;
+};
+
+// NOTE huhaosheng defined
+struct spdk_index_file_info {
+	uint32_t start_vid;	/** the first of vstream ids. total INDEX_VSTREAM_NUM vstream ids */
+	struct chunk2vstream_table	*table;
+	pthread_mutex_t	lock;
+	// TODO cluster-vstream map
+	TAILQ_ENTRY(spdk_index_file_info) link;
+};
+
+// NOTE huhaosheng defined
+struct chunk2vstream_table {
+	struct spdk_index_file_info	*file_info;
+	uint32_t 	visit_count[MAX_CHUNK_NUM];
+	uint32_t 	score[MAX_CHUNK_NUM];
+	uint32_t 	score_hottest;
+	//	chunk recently visit time
+	uint64_t	visit_time[MAX_CHUNK_NUM];
+	// degradation 	interval
+	uint64_t 	period;
+	uint64_t	restart_time;
+};
+/** huhaosheng defined end */
 
 /**
  * Blobstore operation completion callback.
@@ -755,7 +817,7 @@ void spdk_blob_io_write(struct spdk_blob *blob, struct spdk_io_channel *channel,
 
 // NOTE denghejian declare spdk_blob_io_write_ms
 void spdk_blob_io_write_ms(struct spdk_blob *blob, struct spdk_io_channel *channel,
-			void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+			void *payload, uint64_t offset, uint64_t length, uint8_t file_type, void *file_info,
 			spdk_blob_op_complete cb_fn, void *cb_arg);
 
 /**

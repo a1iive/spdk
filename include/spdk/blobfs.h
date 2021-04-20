@@ -355,7 +355,7 @@ int spdk_file_write(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 
 // NOTE huhaosheng declared
 int spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
-		    void *payload, uint64_t offset, uint64_t length);
+		    void *payload, uint64_t offset, uint64_t length, bool checkpoint);
 
 /**
  * Read data to user buffer from the given file.
@@ -580,7 +580,7 @@ void spdk_file_write_async(struct spdk_file *file, struct spdk_io_channel *chann
 
 // NOTE denghejian declare spdk_file_write_async_ms
 void spdk_file_write_async_ms(struct spdk_file *file, struct spdk_io_channel *channel,
-			   void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+			   void *payload, uint64_t offset, uint64_t length, uint8_t file_type, void *file_info,
 			   spdk_file_op_complete cb_fn, void *cb_arg);
 
 /**
