@@ -179,33 +179,6 @@ struct spdk_blob {
 	uint64_t	remaining_clusters_in_et;
 };
 
-// NOTE: huhaosheng declared
-// TODO: confirm stream id from 0->end or 1->end
-struct spdk_virtual_stream_info
-{
-	uint32_t physical_stream_id;
-	uint64_t total_visit_nums;
-	uint64_t total_evict_nums;
-	pthread_mutex_t	 lock; // NOTE : pthread_mutex_t change to pthread_spinlock_t
-};
-struct spdk_physical_stream_info
-{
-	uint64_t total_visit_nums;
-	uint64_t total_evict_nums;
-	double ratio;
-	pthread_mutex_t	 lock;
-};
-
-// NOTE: huhaosheng declared
-struct spdk_cluster_stats {
-	uint64_t visit_nums;
-	uint64_t evict_nums;
-	pthread_mutex_t	 lock;
-	/* if block per cluster == n , bitmap bits = n/8 */
-	/* block(io_unit) id = x, block(io_unit) per cluster = n: spdk_bit_array_get(blocks, x % n) */
-	struct spdk_bit_array	*pages;
-};
-
 struct spdk_blob_store {
 	uint64_t			md_start; /* Offset from beginning of disk, in pages */
 	uint32_t			md_len; /* Count, in pages */
@@ -242,19 +215,6 @@ struct spdk_blob_store {
 	TAILQ_HEAD(, spdk_blob_list)	snapshots;
 
 	bool                            clean;
-
-	/* NOTE: for multi stream */
-	struct spdk_cluster_stats      *cluster_stats;          	/** size = total_clusters */
-	uint32_t 						num_virtual_streams;		/** = SPDK_NUM_VIRTUAL_STREAMS */
-	uint32_t 						num_physical_streams;		/** = SPDK_NUM_PHYSICAL_STREAMS */
-	struct spdk_virtual_stream_info        *virtual_streams; 	/** size = num_virtual_streams */
-	struct spdk_physical_stream_info 	   *physical_streams;	/** size = num_physical_streams */
-
-	bool stream_upd_tid_set;
-	bool stream_upd_loop;
-	pthread_t stream_upd_thread_id;
-	pthread_mutex_t stream_upd_mtx;
-	pthread_cond_t stream_upd_cond;
 };
 
 struct spdk_bs_channel {
@@ -744,26 +704,72 @@ bs_io_unit_is_allocated(struct spdk_blob *blob, uint64_t io_unit)
 	}
 }
 
-// NOTE huhaosheng 
-/**
- * update cluster stats and virtual/physical stream stats
- *
- * \param stream_id the virtual stream id
- *
- * \return   the physical stream id
- */
-static inline uint32_t 
-blob_get_pstream_id(struct spdk_blob *blob, uint32_t vstream_id) {
-	uint32_t pstream_id;
-	// TODO : failure
-	assert(vstream_id < blob->bs->num_virtual_streams);
+// NOTE huhaosheng defined
+/** NOTE hhs stat fprintf start */
+#define   	LOG_TO_FILE  		1
+#define		LV_LOG			    5		//<推荐使用>  输出到log文件
 
-	pthread_mutex_lock(&(blob->bs->virtual_streams[vstream_id].lock));
-	pstream_id = blob->bs->virtual_streams[vstream_id].physical_stream_id;
-	pthread_mutex_unlock(&(blob->bs->virtual_streams[vstream_id].lock));
+extern FILE *spdk_log_file_fp;
+extern const char spdk_log_file_path[];
+extern int Spdk_Debug_Level;
 
-	return pstream_id;
-}
+#if LOG_TO_FILE
 
+    static inline void SpdkDebugInit(void) {
+        spdk_log_file_fp = fopen(spdk_log_file_path, "w+");
+        if(spdk_log_file_fp == NULL){
+            printf("creat spdk_log_file_fp: %s error!\n", spdk_log_file_path);
+            //exit(0);
+        } else
+        {
+            printf("creat spdk_log_file_fp: %s ok!\n", spdk_log_file_path);
+        }
+        
+    }
+
+    static inline void SpdkDebugDestroy(void) {
+        fclose(spdk_log_file_fp);
+    }
+
+#else
+    static inline void SpdkDebugInit(void) {}
+    static inline void SpdkDebugDestroy(void) {}
+#endif
+
+static const char *Debuginfo[] = {
+    "Error", "Warning", "Info", "Debbug", "None", "LOG"
+};
+
+#define MYDEBUG
+
+#ifdef MYDEBUG
+#define MYPRINT printf
+
+
+//	程序中请使用 DBG_PRINT 宏
+#define SPDK_DBG_PRINT(level, format, ...)  \
+do{                                 \
+	struct timeval local;\
+	gettimeofday(&local , NULL);\
+	if (level <= Spdk_Debug_Level)  {    \
+        MYPRINT("%-7s: %-20s %3d: "format"\n", Debuginfo[level], __FUNCTION__, __LINE__, ##__VA_ARGS__);\
+        fflush(stdout);\
+	}\
+    else if(LOG_TO_FILE && level == LV_LOG) {  \
+        if(spdk_log_file_fp == NULL) MYPRINT("[%-15s][%3d]:spdk_log_file_fp error!\n",  __FUNCTION__, __LINE__);  \
+        else { \
+            fprintf(spdk_log_file_fp, "%ld,%ld,"format"\n", \
+                local.tv_sec, local.tv_usec, ##__VA_ARGS__); \
+            fflush(spdk_log_file_fp);  \
+        }\
+    }\
+}while(0)	
+
+#else
+
+#define SPDK_DBG_PRINT(level, format, a...)
+
+#endif
+/** hhs stat fprintf end */
 
 #endif

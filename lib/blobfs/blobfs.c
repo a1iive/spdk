@@ -169,12 +169,6 @@ struct spdk_filesystem {
 	// TAILQ_HEAD(, spdk_log_file_info) 		logFiles;
 	TAILQ_HEAD(, spdk_data_file_info) 		dFiles;
 	TAILQ_HEAD(, spdk_index_file_info) 		iFiles;
-
-	bool boundary_upd_tid_set;
-	bool boundary_upd_loop;
-	pthread_t boundary_upd_thread_id;
-	pthread_mutex_t boundary_upd_mtx;
-	pthread_cond_t boundary_upd_cond;
 	/** huhaosheng declared end */
 
 	struct {
@@ -628,50 +622,6 @@ update_boundary(struct spdk_data_file_info *file_info) {
 	return boundary_off;
 }
 
-// NOTE huhaosheng defined
-/**
- * Periodically update data files boundary 
- * in background thread
- */
-static void *
-fs_boundary_update_fn(void *arg) {
-	struct spdk_filesystem * fs = arg;
-	fs->boundary_upd_loop = true;
-	struct timespec			ts;
-	struct timeval now;
-	int rc;
-
-	pthread_mutex_lock(&fs->boundary_upd_mtx);
-	while(fs->boundary_upd_loop) {
-		if (gettimeofday(&now, NULL) < 0) {
-			printf("Cannot get current time\n");
-			break;
-		}
-		
-		ts.tv_nsec = (now.tv_usec * 1000) % 1000000000;
-		ts.tv_sec = now.tv_sec + BOUNDARY_UPDATE_TIMEOUT +
-				(now.tv_usec * 1000) / 1000000000;
-
-		rc = pthread_cond_timedwait((&fs->boundary_upd_cond), &fs->boundary_upd_mtx, &ts);
-		if (rc != ETIMEDOUT) {
-			break;
-		}
-		if(fs->boundary_upd_loop) {
-			/**  Do work */ 
-			printf("fs_boundary_update_fn do work once!\n");
-			struct spdk_data_file_info *file_info;
-			TAILQ_FOREACH(file_info, &fs->dFiles, link) {
-				// FIXME whether need lock
-				pthread_mutex_lock(&file_info->lock);
-				file_info->boundary_offset = update_boundary(file_info);
-				pthread_mutex_unlock(&file_info->lock);
-			}
-		}
-	}
-	pthread_mutex_unlock(&fs->boundary_upd_mtx);
-	return NULL;
-}
-
 static struct spdk_filesystem *
 fs_alloc(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn)
 {
@@ -687,11 +637,6 @@ fs_alloc(struct spdk_bs_dev *dev, fs_send_request_fn send_request_fn)
 	fs->g_vstream_id = 0;
 	TAILQ_INIT(&fs->dFiles);
 	TAILQ_INIT(&fs->iFiles);
-
-	pthread_mutex_init(&fs->boundary_upd_mtx, NULL);
-	pthread_cond_init(&fs->boundary_upd_cond, NULL);
-	pthread_create(&(fs->boundary_upd_thread_id), NULL, &fs_boundary_update_fn, (void*)fs);
-	fs->boundary_upd_tid_set = true;
 	/** huhaosheng defiend end */
 
 	fs->bdev = dev;
@@ -1099,19 +1044,6 @@ unload_cb(void *ctx, int bserrno)
 	struct spdk_file *file, *tmp;
 
 	/** NOTE huhaosheng defined start */
-	// close pthread first
-	if(fs->boundary_upd_tid_set) {
-		pthread_mutex_lock(&fs->boundary_upd_mtx);
-		fs->boundary_upd_loop = false;
-		pthread_cond_signal(&fs->boundary_upd_cond);
-		pthread_mutex_unlock(&fs->boundary_upd_mtx);
-		pthread_join(fs->boundary_upd_thread_id, NULL);
-
-		pthread_mutex_destroy(&fs->boundary_upd_mtx);
-		pthread_cond_destroy(&fs->boundary_upd_cond);
-		fs->boundary_upd_tid_set = false;
-	}
-		
 	struct spdk_data_file_info *dfile_info, *dtmp_info;
 	TAILQ_FOREACH_SAFE(dfile_info, &fs->dFiles, link, dtmp_info) {
 		pthread_mutex_destroy(&dfile_info->lock);
@@ -3030,26 +2962,6 @@ __send_rw_from_file(struct spdk_file *file, void *payload,
 }
 
 // NOTE huhaosheng defined
-static void
-clear_chunk2vid_table(struct spdk_filesystem *fs) {
-	struct spdk_index_file_info *file_info;
-	struct chunk2vstream_table 	*table;
-	uint64_t now = spdk_get_ticks();
-	TAILQ_FOREACH(file_info, &fs->iFiles, link) {
-		table = file_info->table;
-		pthread_mutex_lock(&file_info->lock);
-		table->restart_time = now;
-		table->period = 1;	// NOTE prevent division overflow
-		table->score_hottest = 0;
-		memset(table->score, 0, sizeof(table->score));
-		memset(table->visit_time, 0, sizeof(table->visit_time));
-		memset(table->visit_count, 0, sizeof(table->visit_count));
-		pthread_mutex_unlock(&file_info->lock);
-	}
-	return;
-}
-
-// NOTE huhaosheng defined
 int
 spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 		void *payload, uint64_t offset, uint64_t length, bool checkpoint)
@@ -3076,16 +2988,6 @@ spdk_file_write_ms(struct spdk_file *file, struct spdk_fs_thread_ctx *ctx,
 	}
 
 	sem_wait(&channel->sem);
-
-	/** NOTE huhaosheng added start */
-	// update data file info
-	const char *fname = basename(file->name);
-	if(strcmp(fname, "WiredTiger.wt") == 0 && checkpoint) { // means one checkpoint have done right now
-		// clear all index files's chunk2vid table
-		printf("spdk_file_write_ms : one checkpoint have done : write length = %lu\n", length);
-		clear_chunk2vid_table(file->fs);
-	}
-	/** huhaosheng added end */
 
 	return arg.rwerrno;
 }
