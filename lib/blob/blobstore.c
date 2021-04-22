@@ -2698,7 +2698,7 @@ blob_request_submit_op_split(struct spdk_io_channel *ch, struct spdk_blob *blob,
 // NOTE denghejian define blob_request_submit_op_single_ms
 static void
 blob_request_submit_op_single_ms(struct spdk_io_channel *_ch, struct spdk_blob *blob,
-			      void *payload, uint64_t offset, uint64_t length, uint32_t vstream_id,
+			      void *payload, uint64_t offset, uint64_t length, uint32_t pstream_id,
 			      spdk_blob_op_complete cb_fn, void *cb_arg, enum spdk_blob_op_type op_type)
 {
 	struct spdk_bs_cpl cpl;
@@ -2772,7 +2772,7 @@ blob_request_submit_op_single_ms(struct spdk_io_channel *_ch, struct spdk_blob *
 				// NOTE huhaosheng defined
 				SPDK_DBG_PRINT(LV_LOG, "%d,%u", 0, lba_count * blob->bs->io_unit_size);
 				// NOTE denghejian use bs_batch_write_dev_ms
-				bs_batch_write_dev_ms(batch, payload, lba, lba_count, 0);
+				bs_batch_write_dev_ms(batch, payload, lba, lba_count, pstream_id);
 			} else {
 				// NOTE huhaosheng defined
 				SPDK_DBG_PRINT(LV_LOG, "%d,%u", 1, lba_count * blob->bs->io_unit_size);
@@ -2953,8 +2953,19 @@ blob_request_submit_op_ms(struct spdk_blob *blob, struct spdk_io_channel *_chann
 		return;
 	}
 	if (length <= bs_num_io_units_to_cluster_boundary(blob, offset)) {
+		// NOTE huhaosheng defined
+		uint32_t pstream_id;
+		if(file_type == 0) {
+			pstream_id = 0;
+		} else if(file_type == 1) {
+			pstream_id = 1;
+		} else if(file_type == 2) {
+			pstream_id = 2;
+		} else {
+			pstream_id = 3;
+		}
 		// NOTE denghejian use blob_request_submit_op_single_ms
-		blob_request_submit_op_single_ms(_channel, blob, payload, offset, length, 0,
+		blob_request_submit_op_single_ms(_channel, blob, payload, offset, length, pstream_id,
 					      cb_fn, cb_arg, op_type);
 	} else {
 		// NOTE huhaosheng changed
